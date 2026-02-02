@@ -1,0 +1,42 @@
+{
+    "x": 0,
+    "width": 1590.2,
+    "y": 0,
+    "items": [
+        {
+            "fileName": "1-6.pdf",
+            "level": 6,
+            "haveFile": true,
+            "rotation": 0.0,
+            "type": "logo",
+            "points": [
+                [
+                    1539.98,
+                    -55.36
+                ],
+                [
+                    -50.22,
+                    -55.36
+                ],
+                [
+                    -50.22,
+                    188.59
+                ],
+                [
+                    1539.98,
+                    188.59
+                ]
+            ],
+            "isGuides": false,
+            "graphicType": "PathItem",
+            "width": 1590.2,
+            "x": -50.22,
+            "isContour": false,
+            "y": -55.36,
+            "graphicPath": "C:/Users/Candy/Desktop/DrawingTools_v22/i_jersey_graphs_ai/1-6.pdf",
+            "height": 243.95
+        }
+    ],
+    "logoId": "1588134014484928869",
+    "height": 243.95
+}
