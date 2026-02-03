@@ -12,9 +12,9 @@ class FourierFeatureEncoder(nn.Module):
         super().__init__()
         self.num_bands = num_bands
         # Create frequencies: 2^0, 2^1, ..., 2^(L-1)
-        # We use logspace to span the frequencies
-        freqs = torch.linspace(0.0, math.log(max_freq), num_bands)
-        self.register_buffer('freqs', torch.exp(freqs) * math.pi)
+        # We use powers of two to span the frequencies
+        freqs = torch.arange(num_bands, dtype=torch.float32)
+        self.register_buffer('freqs', torch.pow(2.0, freqs) * math.pi)
 
     def forward(self, x):
         # Input x: (Batch, Seq_Len) or (Batch, Seq_Len, 1)
@@ -99,7 +99,11 @@ class ShapeAwareLayoutTransformer(nn.Module):
         self.emb_cls = nn.Embedding(num_classes, d_model // 4)
         
         # Position gets its own projection after Fourier encoding
-        self.emb_pos = nn.Linear(raw_fourier_dim, d_model // 2)
+        self.emb_pos = nn.Sequential(
+            nn.Linear(raw_fourier_dim, d_model // 2),
+            nn.ReLU(),
+            nn.Linear(d_model // 2, d_model // 2),
+        )
         
         # Size (w, h) gets a simple linear projection
         self.emb_size = nn.Linear(2, d_model // 8)
