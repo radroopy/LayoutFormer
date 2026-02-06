@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 import argparse
 import json
 import random
@@ -29,6 +29,11 @@ def main():
     parser.add_argument("--train", type=float, default=0.7, help="Train ratio")
     parser.add_argument("--val", type=float, default=0.1, help="Val ratio")
     parser.add_argument("--test", type=float, default=0.2, help="Test ratio")
+    parser.add_argument(
+        "--exclude-self",
+        action="store_true",
+        help="Exclude same-size pairs (src_size==tgt_size). Default is to include them (e.g., L->L).",
+    )
     args = parser.parse_args()
 
     shape_index_path = Path(args.shape_index)
@@ -62,7 +67,7 @@ def main():
         pairs = []
         for src_size in sizes:
             for tgt_size in sizes:
-                if src_size == tgt_size:
+                if args.exclude_self and src_size == tgt_size:
                     continue
                 src_json = size_map[src_size]
                 tgt_json = size_map[tgt_size]
