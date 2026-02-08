@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 from models.LayoutFormer import LayoutFormer
 from train.train_layoutformer import load_pattern_points, load_elements, build_scale_lookup, PairDataset, collate_batch
 
+NORM_RANGE = 10.0
 
 def main():
     parser = argparse.ArgumentParser(description="Test LayoutFormer: load weights, run prediction, save results.")
@@ -110,6 +111,10 @@ def main():
 
     results = []
     idx = 0
+
+    # running sums for mean absolute error
+    mae_sum = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    mae_count = 0
     with torch.no_grad():
         for batch in loader:
             (
@@ -144,6 +149,21 @@ def main():
             pred_np = pred.cpu().numpy()
             valid_np = valid.numpy()
 
+            # accumulate mean absolute error over valid elements
+            tgt_np = tgt_geom.numpy()
+            for bi in range(pred_np.shape[0]):
+                mask = valid_np[bi] > 0.0
+                if mask.any():
+                    diff = abs(pred_np[bi][mask] - tgt_np[bi][mask])
+                    mae_sum[0] += float(diff[:, 0].sum())
+                    mae_sum[1] += float(diff[:, 1].sum())
+                    mae_sum[2] += float(diff[:, 2].sum())
+                    mae_sum[3] += float(diff[:, 3].sum())
+                    if diff.shape[1] >= 6:
+                        mae_sum[4] += float(diff[:, 4].sum())
+                        mae_sum[5] += float(diff[:, 5].sum())
+                    mae_count += int(mask.sum())
+
             for b in range(pred_np.shape[0]):
                 pair = pairs[idx]
 
@@ -157,19 +177,25 @@ def main():
                     raise KeyError(f"missing layout for {src_json}")
                 pdf_paths = list(layout.get("pdf_paths", []))
                 element_ids = list(layout.get("element_ids", []))
+                logo_levels = [int(v) if v is not None else None for v in layout.get("logo_level", [])]
+                if logo_levels and len(logo_levels) != len(pdf_paths):
+                    raise ValueError(f"logo_levels length mismatch for {src_json}")
                 if element_ids and len(element_ids) != len(pdf_paths):
                     raise ValueError(f"element_ids length mismatch for {src_json}")
                 if not element_ids:
                     element_ids = [None] * len(pdf_paths)
+                if not logo_levels:
+                    logo_levels = [-1] * len(pdf_paths)
                 max_elems = int(pred_np.shape[1])
                 if len(pdf_paths) > max_elems:
                     raise ValueError(f"element count {len(pdf_paths)} exceeds max_elements {max_elems} for {src_json}")
                 pdf_paths = pdf_paths + [None] * (max_elems - len(pdf_paths))
                 element_ids = element_ids + [None] * (max_elems - len(element_ids))
+                logo_levels = logo_levels + [-1] * (max_elems - len(logo_levels))
                 tgt_scale = pair.get("tgt_scale")
                 if tgt_scale is not None:
                     pred_denorm = pred_np[b].copy()
-                    pred_denorm[:, :4] = pred_denorm[:, :4] * float(tgt_scale)
+                    pred_denorm[:, :4] = pred_denorm[:, :4] * float(tgt_scale) / NORM_RANGE
                 else:
                     pred_denorm = None
 
@@ -182,11 +208,25 @@ def main():
                     "tgt_scale": tgt_scale,
                     "pdf_paths": pdf_paths,
                     "element_ids": element_ids,
+                    "logo_levels": logo_levels,
                     "pred": pred_np[b].tolist(),
                     "pred_denorm": pred_denorm.tolist() if pred_denorm is not None else None,
                     "valid": valid_np[b].tolist(),
                 })
                 idx += 1
+
+    if mae_count > 0:
+        mae = [v / mae_count for v in mae_sum]
+        if mae_sum[4] == 0.0 and mae_sum[5] == 0.0:
+            print(
+                "MAE (x,y,w,h): "
+                f"{mae[0]:.6f} {mae[1]:.6f} {mae[2]:.6f} {mae[3]:.6f}"
+            )
+        else:
+            print(
+                "MAE (x,y,w,h,sin,cos): "
+                f"{mae[0]:.6f} {mae[1]:.6f} {mae[2]:.6f} {mae[3]:.6f} {mae[4]:.6f} {mae[5]:.6f}"
+            )
 
     out_path = out_dir / f"predictions_{args.split_name}.json"
     out_path.write_text(json.dumps(results, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

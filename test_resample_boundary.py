@@ -6,6 +6,7 @@ from PIL import Image, ImageDraw
 
 from boundary_resample import resample_boundary
 
+NORM_RANGE = 10.0
 
 def main():
     # ????? JSON ??
@@ -25,7 +26,7 @@ def main():
 
     if json_path.stem.endswith("-n"):
         scale = max(width, height)
-        points = [(x * scale, y * scale) for x, y in points]
+        points = [(x * scale / NORM_RANGE, y * scale / NORM_RANGE) for x, y in points]
 
     image = Image.new("RGBA", (int(round(width)), int(round(height))), (0, 0, 0, 0))
     img_w, img_h = image.size

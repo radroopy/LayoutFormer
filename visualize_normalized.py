@@ -21,6 +21,7 @@ COL_Y = 12
 COL_W = 13
 COL_H = 14
 COL_SCALE = 37
+NORM_RANGE = 10.0
 
 COLOR_ELEM_NORM = (0, 0, 0, 255)
 COLOR_ELEM_ORIG = (80, 80, 80, 160)
@@ -47,8 +48,8 @@ def scale_point(pt, width, height, scale, img_w, img_h, normalized):
     x = pt[0]
     y = pt[1]
     if normalized:
-        x *= scale
-        y *= scale
+        x *= scale / NORM_RANGE
+        y *= scale / NORM_RANGE
     if img_w <= 1:
         x_px = 0.0
     else:
@@ -235,10 +236,10 @@ def load_elements_map(xlsx_path: Path, root: Path, normalized: bool):
             if scale in (None, 0):
                 print(f"row {row}: invalid scale", file=sys.stderr)
                 continue
-            x = x * scale
-            y = y * scale
-            w = w * scale
-            h = h * scale
+            x = x * scale / NORM_RANGE
+            y = y * scale / NORM_RANGE
+            w = w * scale / NORM_RANGE
+            h = h * scale / NORM_RANGE
         else:
             x = x + w / 2.0
             y = y + h / 2.0

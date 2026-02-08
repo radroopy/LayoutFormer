@@ -1,6 +1,7 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ly import FourierFeatureEncoder
 
@@ -21,6 +22,7 @@ class LayoutFormer(nn.Module):
     The model uses (1)-(5) and predicts target geometries (B, Nmax=20, 6).
 
     By default (return_postprocess=True), provide target_scale (S=max(W_target,H_target)) to get denormalized coords; sin/cos stay unchanged.
+    Normalized geometry range is [0, norm_range].
 
     Padding: if src_mask is not provided, rows with type_id==0 and all-zero geometry are masked.
     """
@@ -34,6 +36,7 @@ class LayoutFormer(nn.Module):
         num_layers: int = 4,
         boundary_seq_len: int = 196,
         fourier_bands: int = 10,
+        norm_range: float = 10.0,
     ):
         super().__init__()
         if d_model % 8 != 0:
@@ -42,6 +45,7 @@ class LayoutFormer(nn.Module):
         self.boundary_seq_len = boundary_seq_len
         self.d_model = d_model
         self.max_elements = max_elements
+        self.norm_range = float(norm_range)
 
         # Fourier encoders
         self.fourier_enc = FourierFeatureEncoder(num_bands=fourier_bands)
@@ -73,19 +77,18 @@ class LayoutFormer(nn.Module):
         encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        # Output heads
+        # Output heads (raw -> activation in _decode_elements)
         self.geo_head = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.ReLU(),
             nn.Linear(d_model // 2, 4),
-            nn.Sigmoid(),
         )
-        self.rot_head = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.ReLU(),
-            nn.Linear(d_model // 2, 2),
-            nn.Tanh(),
-        )
+        #         self.rot_head = nn.Sequential(
+        #             nn.Linear(d_model, d_model // 2),
+        #             nn.ReLU(),
+        #             nn.Linear(d_model // 2, 2),
+        #             nn.Tanh(),
+        #         )
 
     def _encode_boundary(self, boundary: torch.Tensor, boundary_type: int) -> torch.Tensor:
         # boundary: (B, K, 2) points OR (B, K, 4L) pre-encoded
@@ -127,16 +130,20 @@ class LayoutFormer(nn.Module):
         """
         elem_start = tgt_len + src_len
         element_features = features[:, elem_start:, :]
-        pred_geo = self.geo_head(element_features)  # (B, N, 4) in [0,1]
-        pred_rot = self.rot_head(element_features)  # (B, N, 2) in [-1,1]
-        return torch.cat([pred_geo, pred_rot], dim=-1)
+        raw_geo = self.geo_head(element_features)
+        pred_xy = torch.sigmoid(raw_geo[..., :2]) * self.norm_range
+        pred_wh = F.softplus(raw_geo[..., 2:4])
+        pred_geo = torch.cat([pred_xy, pred_wh], dim=-1)
+        # pred_rot = self.rot_head(element_features)  # (B, N, 2) in [-1,1]
+        # return torch.cat([pred_geo, pred_rot], dim=-1)
+        return pred_geo
 
     @staticmethod
-    def denormalize(pred: torch.Tensor, target_scale: torch.Tensor) -> torch.Tensor:
+    def denormalize(pred: torch.Tensor, target_scale: torch.Tensor, norm_range: float) -> torch.Tensor:
         """
         Denormalize predicted geometries using isotropic scale S = max(W_target, H_target).
 
-        pred: (B, N, 6) where x,y,w,h are normalized to [0,1]. Only first 4 dims are scaled.
+        pred: (B, N, 6) where x,y,w,h are normalized to [0,norm_range]. Only first 4 dims are scaled.
         target_scale: (B,) or (B,1) or (B,1,1)
         """
         if target_scale.dim() == 1:
@@ -149,7 +156,7 @@ class LayoutFormer(nn.Module):
             raise ValueError("target_scale must be (B,), (B,1), or (B,1,1)")
 
         out = pred.clone()
-        out[..., :4] = out[..., :4] * scale
+        out[..., :4] = out[..., :4] * scale / float(norm_range)
         return out
 
     @staticmethod
@@ -243,6 +250,6 @@ class LayoutFormer(nn.Module):
             return pred
         if target_scale is None:
             raise ValueError("target_scale is required when return_postprocess=True")
-        pred_denorm = self.denormalize(pred, target_scale)
+        pred_denorm = self.denormalize(pred, target_scale, self.norm_range)
         # keep sin/cos unchanged; output stays (B, N, 6)
         return pred_denorm

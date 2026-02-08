@@ -32,6 +32,7 @@ except Exception as exc:  # pragma: no cover
 
 from boundary_resample import load_contour_points
 
+NORM_RANGE = 10.0
 
 @dataclass
 class BBox:
@@ -191,6 +192,30 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--no-rotate",
+        action="store_true",
+        default=True,
+        help="Disable applying predicted rotation to element PDFs (debug).",
+    )
+    parser.add_argument(
+        "--theta-sign",
+        type=float,
+        default=-1.0,
+        help="Rotation sign for display (default -1 for y-up to y-down).",
+    )
+    parser.add_argument(
+        "--logo-order",
+        choices=["asc", "desc"],
+        default="asc",
+        help="Draw order by logo_level (asc draws smaller first; desc draws larger first).",
+    )
+    parser.add_argument(
+        "--theta-offset",
+        type=float,
+        default=0.0,
+        help="Additional rotation offset in degrees.",
+    )
+    parser.add_argument(
         "--draw-box",
         action="store_true",
         help="Draw the rotated (w,h) box outline for each element (debug)",
@@ -288,9 +313,26 @@ def main() -> None:
         pdf_paths = rec.get("pdf_paths") or []
         preds = rec.get("pred") or []
         valids = rec.get("valid") or []
+        logo_levels = rec.get("logo_levels") or []
+
+        def _lvl(v):
+            try:
+                return float(v)
+            except Exception:
+                return -1.0
+
+        max_len = min(len(preds), len(pdf_paths), len(valids))
+        if len(logo_levels) < max_len:
+            logo_levels = list(logo_levels) + [-1] * (max_len - len(logo_levels))
+
+        order = list(range(max_len))
+        if args.logo_order == "asc":
+            order = sorted(order, key=lambda i: (_lvl(logo_levels[i]), i))
+        else:
+            order = sorted(order, key=lambda i: (-_lvl(logo_levels[i]), i))
 
         # Render each element and paste.
-        for i in range(min(len(preds), len(pdf_paths), len(valids))):
+        for i in order:
             if float(valids[i]) <= 0.0:
                 continue
             pdf_rel = pdf_paths[i]
@@ -303,14 +345,22 @@ def main() -> None:
                 missing_pdfs.add(str(pdf_rel))
                 continue
 
-            cx_n, cy_n, w_n, h_n, s, c = preds[i]
-            cx = float(cx_n) * tgt_scale
-            cy = float(cy_n) * tgt_scale
-            w = float(w_n) * tgt_scale
-            h = float(h_n) * tgt_scale
+            vals = preds[i]
+            cx_n, cy_n, w_n, h_n = vals[0], vals[1], vals[2], vals[3]
+            if len(vals) >= 6:
+                s, c = vals[4], vals[5]
+            else:
+                s, c = 0.0, 1.0
+            cx = float(cx_n) * tgt_scale / NORM_RANGE
+            cy = float(cy_n) * tgt_scale / NORM_RANGE
+            w = float(w_n) * tgt_scale / NORM_RANGE
+            h = float(h_n) * tgt_scale / NORM_RANGE
 
-            # Convert angle: our data uses y-up; PyMuPDF page coords are y-down -> negate the angle.
-            theta_deg = -_theta_deg_from_sin_cos(s, c)
+            theta_yup_deg = _theta_deg_from_sin_cos(s, c)
+            if args.no_rotate:
+                theta_deg = 0.0
+            else:
+                theta_deg = args.theta_sign * theta_yup_deg + args.theta_offset
 
             # Rasterize base PDF page (cached) then resize/rotate to match (w,h,theta).
             base_img = _render_pdf_first_page(str(pdf_path), int(args.render_dpi))
@@ -338,7 +388,7 @@ def main() -> None:
                 dy = h / 2.0
 
                 # Use the original (y-up) angle to rotate the box in the same coordinate system as the json points.
-                theta_yup_deg = _theta_deg_from_sin_cos(s, c)
+                theta_yup_deg = -theta_deg
                 ang = math.radians(theta_yup_deg)
                 cos_t = math.cos(ang)
                 sin_t = math.sin(ang)

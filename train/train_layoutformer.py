@@ -2,7 +2,9 @@
 import argparse
 import json
 import math
+import shutil
 import sys
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -12,9 +14,14 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:  # pragma: no cover
+    SummaryWriter = None
 
 from models.LayoutFormer import LayoutFormer
 
+NORM_RANGE = 10.0
 
 def to_str(x):
     """
@@ -85,6 +92,10 @@ def load_elements(npz_path: Path):
     h = data["h"].astype(np.float32)
     sin = data["sin"].astype(np.float32)
     cos = data["cos"].astype(np.float32)
+    if "logo_level" in data:
+        logo_level = data["logo_level"].astype(np.int64)
+    else:
+        logo_level = np.full(labels.shape[0], -1, dtype=np.int64)
     element_embed = data["element_embed"].astype(np.float32)
 
     by_json = {}
@@ -110,6 +121,7 @@ def load_elements(npz_path: Path):
                 axis=-1,
             ),
             "pos_embed": element_embed[sorted_idxs],
+            "logo_level": logo_level[sorted_idxs],
         }
     return layouts
 
@@ -227,16 +239,18 @@ def compute_losses(pred, gt, mask, sdf_maps, sdf_hw):
     """
     pred_xy = pred[..., :2]
     pred_wh = pred[..., 2:4]
-    pred_sc = pred[..., 4:6]
+    # pred_sc = pred[..., 4:6]
 
     gt_xy = gt[..., :2]
     gt_wh = gt[..., 2:4]
-    gt_sc = gt[..., 4:6]
+    # gt_sc = gt[..., 4:6]
 
     l_pos = masked_mean((pred_xy - gt_xy) ** 2, mask)
     l_dim = masked_mean((pred_wh - gt_wh).abs(), mask)
-    l_rot = masked_mean((pred_sc - gt_sc) ** 2, mask)
-    l_reg = masked_mean((pred_sc.pow(2).sum(dim=-1) - 1.0).abs(), mask)
+    # l_rot = masked_mean((pred_sc - gt_sc) ** 2, mask)
+    # l_reg = masked_mean((pred_sc.pow(2).sum(dim=-1) - 1.0).abs(), mask)
+    l_rot = torch.tensor(0.0, device=pred.device)
+    l_reg = torch.tensor(0.0, device=pred.device)
 
     if sdf_maps is None or sdf_hw is None:
         raise ValueError("sdf_maps and sdf_hw are required (L_shape is mandatory).")
@@ -249,8 +263,9 @@ def compute_losses(pred, gt, mask, sdf_maps, sdf_hw):
     w_max = float(sdf_maps.shape[3] - 1)              #batch内最大尺寸
     x_scale = (w - 1.0) / max(w_max, 1.0)
     y_scale = (h - 1.0) / max(h_max, 1.0)
-    grid_x = pred_xy[..., 0] * x_scale.view(-1, 1) * 2 - 1       #映射到grad_sample期望的[-1,1]
-    grid_y = (1 - pred_xy[..., 1]) * y_scale.view(-1, 1) * 2 - 1
+    pred_xy_norm = pred_xy / NORM_RANGE
+    grid_x = pred_xy_norm[..., 0] * x_scale.view(-1, 1) * 2 - 1       #映射到grad_sample期望的[-1,1]
+    grid_y = (1 - pred_xy_norm[..., 1]) * y_scale.view(-1, 1) * 2 - 1
     grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(2)  # (B, N, 1, 2)      #对每个 element 的中心点采样一次,找到对应的SDF值
     sampled = F.grid_sample(
         sdf_maps,
@@ -469,10 +484,15 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--lambda-pos", type=float, default=10.0)
-    parser.add_argument("--lambda-dim", type=float, default=10.0)
-    parser.add_argument("--lambda-rot", type=float, default=3.0)
-    parser.add_argument("--lambda-shape", type=float, default=5.0)
+    parser.add_argument(
+        "--log-dir",
+        default=str(Path(__file__).resolve().parents[1] / "result" / "logs"),
+        help="TensorBoard log directory",
+    )
+    parser.add_argument("--lambda-pos", type=float, default=10)
+    parser.add_argument("--lambda-dim", type=float, default=10)
+    parser.add_argument("--lambda-rot", type=float, default=1.0)
+    parser.add_argument("--lambda-shape", type=float, default=1.0)
     parser.add_argument("--lambda-reg", type=float, default=1.0)
     parser.add_argument("--max-elements", type=int, default=20)
     parser.add_argument("--save-dir", default=str(Path(__file__).resolve().parents[1] / "result" / "model"))
@@ -553,6 +573,15 @@ def main():
     save_dir.mkdir(parents=True, exist_ok=True)
     best_val = math.inf
 
+    writer = None
+    if SummaryWriter is None:
+        print("TensorBoard not available: torch.utils.tensorboard is missing.", file=sys.stderr)
+    else:
+        log_dir = Path(args.log_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        run_name = datetime.now().strftime("%Y%m%d-%H%M%S")
+        writer = SummaryWriter(log_dir=str(log_dir / run_name))
+
     for epoch in range(1, args.epochs + 1):
         model.train()
         running = 0.0
@@ -601,9 +630,9 @@ def main():
             loss = (
                 args.lambda_pos * l_pos
                 + args.lambda_dim * l_dim
-                + args.lambda_rot * l_rot
+                # + args.lambda_rot * l_rot
                 + args.lambda_shape * l_shape
-                + args.lambda_reg * l_reg
+                # + args.lambda_reg * l_reg
             )
 
             running_pos += l_pos.item()
@@ -624,6 +653,15 @@ def main():
         avg_rot = running_rot / denom
         avg_shape = running_shape / denom
         avg_reg = running_reg / denom
+
+        if writer is not None:
+            writer.add_scalar("train/loss", avg_loss, epoch)
+            writer.add_scalar("train/pos", avg_pos, epoch)
+            writer.add_scalar("train/dim", avg_dim, epoch)
+            writer.add_scalar("train/rot", avg_rot, epoch)
+            writer.add_scalar("train/shape", avg_shape, epoch)
+            writer.add_scalar("train/reg", avg_reg, epoch)
+            writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], epoch)
 
         val_loss = None
         geom_sum = None
@@ -676,9 +714,9 @@ def main():
                     loss = (
                         args.lambda_pos * l_pos
                         + args.lambda_dim * l_dim
-                        + args.lambda_rot * l_rot
+                        # + args.lambda_rot * l_rot
                         + args.lambda_shape * l_shape
-                        + args.lambda_reg * l_reg
+                        # + args.lambda_reg * l_reg
                     )
                     val_loss += loss.item()
                     val_pos += l_pos.item()
@@ -705,6 +743,15 @@ def main():
                 f"shape={val_shape:.6f} reg={val_reg:.6f} geom_sum={geom_sum:.6f}"
             )
 
+            if writer is not None:
+                writer.add_scalar("val/loss", val_loss, epoch)
+                writer.add_scalar("val/pos", val_pos, epoch)
+                writer.add_scalar("val/dim", val_dim, epoch)
+                writer.add_scalar("val/rot", val_rot, epoch)
+                writer.add_scalar("val/shape", val_shape, epoch)
+                writer.add_scalar("val/reg", val_reg, epoch)
+                writer.add_scalar("val/geom_sum", geom_sum, epoch)
+
             ckpt = {
                 "epoch": epoch,
                 "model_state": model.state_dict(),
@@ -722,6 +769,57 @@ def main():
                 f"epoch {epoch} train: loss={avg_loss:.6f} pos={avg_pos:.6f} dim={avg_dim:.6f} rot={avg_rot:.6f} "
                 f"shape={avg_shape:.6f} reg={avg_reg:.6f} (eval skipped)"
             )
+
+        if epoch == 5:
+            best_path = save_dir / "best.pt"
+            out_5 = save_dir / "5_best.pt"
+            if best_path.exists():
+                shutil.copy2(best_path, out_5)
+            else:
+                ckpt_5 = {
+                    "epoch": epoch,
+                    "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "val_loss": val_loss,
+                    "geom_sum": geom_sum,
+                    "args": vars(args),
+                }
+                torch.save(ckpt_5, out_5)
+
+        if epoch == 200:
+            best_path = save_dir / "best.pt"
+            out_200 = save_dir / "200_best.pt"
+            if best_path.exists():
+                shutil.copy2(best_path, out_200)
+            else:
+                ckpt_200 = {
+                    "epoch": epoch,
+                    "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "val_loss": val_loss,
+                    "geom_sum": geom_sum,
+                    "args": vars(args),
+                }
+                torch.save(ckpt_200, out_200)        
+
+        if epoch == 500:
+            best_path = save_dir / "best.pt"
+            out_500 = save_dir / "500_best.pt"
+            if best_path.exists():
+                shutil.copy2(best_path, out_500)
+            else:
+                ckpt_500 = {
+                    "epoch": epoch,
+                    "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "val_loss": val_loss,
+                    "geom_sum": geom_sum,
+                    "args": vars(args),
+                }
+                torch.save(ckpt_500, out_500)
+
+    if writer is not None:
+        writer.close()
 
 
 if __name__ == "__main__":

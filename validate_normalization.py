@@ -15,6 +15,7 @@ COL_H = 14
 COL_SCALE = 37
 
 DEFAULT_EPS = 1e-6
+NORM_RANGE = 10.0
 
 
 class ErrorTracker:
@@ -64,7 +65,7 @@ def strip_points(obj):
 
 
 def expected_point(pt, scale):
-    return [pt[0] / scale, pt[1] / scale]
+    return [pt[0] / scale * NORM_RANGE, pt[1] / scale * NORM_RANGE]
 
 
 def validate_point_list(orig, norm, scale, eps, tracker, ctx):
@@ -247,10 +248,10 @@ def validate_xlsx(xlsx_path: Path, norm_path: Path, root: Path, eps: float, trac
             rows_checked += 1
             continue
 
-        exp_x = (x + w / 2.0) / scale
-        exp_y = (y + h / 2.0) / scale
-        exp_w = w / scale
-        exp_h = h / scale
+        exp_x = (x + w / 2.0) / scale * NORM_RANGE
+        exp_y = (y + h / 2.0) / scale * NORM_RANGE
+        exp_w = w / scale * NORM_RANGE
+        exp_h = h / scale * NORM_RANGE
 
         got_x = to_float(ws_norm.cell(row=row, column=COL_X).value)
         got_y = to_float(ws_norm.cell(row=row, column=COL_Y).value)
