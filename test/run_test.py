@@ -37,7 +37,7 @@ def main():
     )
     parser.add_argument(
         "--ckpt",
-        default=str(Path(__file__).resolve().parents[1] / "result" / "model" / "best.pt"),
+        default=str(Path(__file__).resolve().parents[1] / "result"  / "best.pt"),
         help="Checkpoint path",
     )
     parser.add_argument(
@@ -49,6 +49,9 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--d-model", type=int, default=384)
+    parser.add_argument("--num-layers", type=int, default=6)
+    parser.add_argument("--nhead", type=int, default=8)
     parser.add_argument(
         "--out-dir",
         default=str(Path(__file__).resolve().parent / "result"),
@@ -92,9 +95,9 @@ def main():
     model = LayoutFormer(
         num_element_types=num_types,
         max_elements=20,
-        d_model=256,
-        nhead=8,
-        num_layers=4,
+        d_model=args.d_model,
+        nhead=args.nhead,
+        num_layers=args.num_layers,
         boundary_seq_len=points_embed.shape[1],
         fourier_bands=10,
     ).to(args.device)
@@ -151,15 +154,18 @@ def main():
 
             # accumulate mean absolute error over valid elements
             tgt_np = tgt_geom.numpy()
+            pred_dim = pred_np.shape[-1]
+            tgt_dim = tgt_np.shape[-1]
+            cmp_dim = min(pred_dim, tgt_dim)
             for bi in range(pred_np.shape[0]):
                 mask = valid_np[bi] > 0.0
                 if mask.any():
-                    diff = abs(pred_np[bi][mask] - tgt_np[bi][mask])
-                    mae_sum[0] += float(diff[:, 0].sum())
-                    mae_sum[1] += float(diff[:, 1].sum())
-                    mae_sum[2] += float(diff[:, 2].sum())
-                    mae_sum[3] += float(diff[:, 3].sum())
-                    if diff.shape[1] >= 6:
+                    pred_vals = pred_np[bi][mask][:, :cmp_dim]
+                    tgt_vals = tgt_np[bi][mask][:, :cmp_dim]
+                    diff = abs(pred_vals - tgt_vals)
+                    for i in range(min(4, cmp_dim)):
+                        mae_sum[i] += float(diff[:, i].sum())
+                    if cmp_dim >= 6:
                         mae_sum[4] += float(diff[:, 4].sum())
                         mae_sum[5] += float(diff[:, 5].sum())
                     mae_count += int(mask.sum())

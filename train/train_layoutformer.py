@@ -2,8 +2,10 @@
 import argparse
 import json
 import math
+import os
 import shutil
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -22,6 +24,32 @@ except Exception:  # pragma: no cover
 from models.LayoutFormer import LayoutFormer
 
 NORM_RANGE = 10.0
+
+
+def safe_torch_save(obj: dict, path: Path):
+    """
+    安全保存模型权重，避免 Windows 上文件被占用/映射导致 1224 失败。
+    逻辑：
+      1) 先写入临时文件
+      2) 尝试 replace 到目标
+      3) 若失败（例如目标文件被占用），则改用带时间戳的文件名保存
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        torch.save(obj, tmp)
+        try:
+            os.replace(tmp, path)
+        except Exception as exc:
+            fallback = path.with_name(f"{path.stem}_{int(time.time())}{path.suffix}")
+            os.replace(tmp, fallback)
+            print(f"[WARN] could not replace {path} ({exc}); saved to {fallback}")
+    except Exception as exc:
+        print(f"[WARN] failed to save {path}: {exc}")
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
 
 def to_str(x):
     """
@@ -221,7 +249,7 @@ def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 
 
 # 计算损失：位置/尺寸/旋转 + 正则 + L_shape(中心点采样SDF)
-def compute_losses(pred, gt, mask, sdf_maps, sdf_hw):
+def compute_losses(pred, gt, mask, sdf_maps, sdf_hw, log_dim=False, log_pos=False, log_eps=1e-6):
     """
     计算训练/验证用的各项损失（与你给的公式对齐）。
     
@@ -245,8 +273,19 @@ def compute_losses(pred, gt, mask, sdf_maps, sdf_hw):
     gt_wh = gt[..., 2:4]
     # gt_sc = gt[..., 4:6]
 
-    l_pos = masked_mean((pred_xy - gt_xy) ** 2, mask)
-    l_dim = masked_mean((pred_wh - gt_wh).abs(), mask)
+    if log_pos:
+        pred_xy_log = torch.log1p(pred_xy.clamp(min=0.0) + log_eps)
+        gt_xy_log = torch.log1p(gt_xy.clamp(min=0.0) + log_eps)
+        l_pos = masked_mean((pred_xy_log - gt_xy_log) ** 2, mask)
+    else:
+        l_pos = masked_mean((pred_xy - gt_xy) ** 2, mask)
+
+    if log_dim:
+        pred_wh_log = torch.log1p(pred_wh.clamp(min=0.0) + log_eps)
+        gt_wh_log = torch.log1p(gt_wh.clamp(min=0.0) + log_eps)
+        l_dim = masked_mean((pred_wh_log - gt_wh_log).abs(), mask)
+    else:
+        l_dim = masked_mean((pred_wh - gt_wh).abs(), mask)
     # l_rot = masked_mean((pred_sc - gt_sc) ** 2, mask)
     # l_reg = masked_mean((pred_sc.pow(2).sum(dim=-1) - 1.0).abs(), mask)
     l_rot = torch.tensor(0.0, device=pred.device)
@@ -495,6 +534,36 @@ def main():
     parser.add_argument("--lambda-shape", type=float, default=1.0)
     parser.add_argument("--lambda-reg", type=float, default=1.0)
     parser.add_argument("--max-elements", type=int, default=20)
+    parser.add_argument("--d-model", type=int, default=384)
+    parser.add_argument("--num-layers", type=int, default=6)
+    parser.add_argument("--nhead", type=int, default=8)
+    parser.add_argument(
+        "--log-dim-loss",
+        dest="log_dim_loss",
+        action="store_true",
+        default=True,
+        help="Use log1p loss for w/h (default: on).",
+    )
+    parser.add_argument(
+        "--no-log-dim-loss",
+        dest="log_dim_loss",
+        action="store_false",
+        help="Disable log1p loss for w/h.",
+    )
+    parser.add_argument(
+        "--log-pos-loss",
+        dest="log_pos_loss",
+        action="store_true",
+        default=False,
+        help="Use log1p loss for x/y (default: off).",
+    )
+    parser.add_argument(
+        "--no-log-pos-loss",
+        dest="log_pos_loss",
+        action="store_false",
+        help="Disable log1p loss for x/y.",
+    )
+    parser.add_argument("--log-eps", type=float, default=1e-6)
     parser.add_argument("--save-dir", default=str(Path(__file__).resolve().parents[1] / "result" / "model"))
     parser.add_argument("--sdf-dir", default=str(Path(__file__).resolve().parents[1] / "sdf_maps"), help="Directory of SDF maps (required)")
     parser.add_argument("--sdf-ext", default=".npy", help="SDF file extension (default: .npy)")
@@ -560,9 +629,9 @@ def main():
     model = LayoutFormer(
         num_element_types=num_types,
         max_elements=args.max_elements,
-        d_model=256,
-        nhead=8,
-        num_layers=4,
+        d_model=args.d_model,
+        nhead=args.nhead,
+        num_layers=args.num_layers,
         boundary_seq_len=points_embed.shape[1],
         fourier_bands=10,
     ).to(args.device)
@@ -625,7 +694,14 @@ def main():
             )
 
             l_pos, l_dim, l_rot, l_reg, l_shape = compute_losses(
-                pred, tgt_geom, valid, sdf_maps=sdf_maps, sdf_hw=sdf_hw
+                pred,
+                tgt_geom,
+                valid,
+                sdf_maps=sdf_maps,
+                sdf_hw=sdf_hw,
+                log_dim=args.log_dim_loss,
+                log_pos=args.log_pos_loss,
+                log_eps=args.log_eps,
             )
             loss = (
                 args.lambda_pos * l_pos
@@ -760,10 +836,10 @@ def main():
                 "geom_sum": geom_sum,
                 "args": vars(args),
             }
-            torch.save(ckpt, save_dir / "last.pt")
+            safe_torch_save(ckpt, save_dir / "last.pt")
             if val_loss < best_val:
                 best_val = val_loss
-                torch.save(ckpt, save_dir / "best.pt")
+                safe_torch_save(ckpt, save_dir / "best.pt")
         else:
             print(
                 f"epoch {epoch} train: loss={avg_loss:.6f} pos={avg_pos:.6f} dim={avg_dim:.6f} rot={avg_rot:.6f} "
@@ -784,7 +860,7 @@ def main():
                     "geom_sum": geom_sum,
                     "args": vars(args),
                 }
-                torch.save(ckpt_5, out_5)
+                safe_torch_save(ckpt_5, out_5)
 
         if epoch == 200:
             best_path = save_dir / "best.pt"
@@ -800,7 +876,7 @@ def main():
                     "geom_sum": geom_sum,
                     "args": vars(args),
                 }
-                torch.save(ckpt_200, out_200)        
+                safe_torch_save(ckpt_200, out_200)
 
         if epoch == 500:
             best_path = save_dir / "best.pt"
@@ -816,7 +892,7 @@ def main():
                     "geom_sum": geom_sum,
                     "args": vars(args),
                 }
-                torch.save(ckpt_500, out_500)
+                safe_torch_save(ckpt_500, out_500)
 
     if writer is not None:
         writer.close()

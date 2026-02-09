@@ -23,7 +23,7 @@ except Exception as exc:  # pragma: no cover
     )
 
 try:
-    from PIL import Image, ImageChops
+    from PIL import Image, ImageChops, ImageDraw
 except Exception as exc:  # pragma: no cover
     raise SystemExit(
         "Pillow is required for image operations. Install with: pip install pillow\n"
@@ -109,6 +109,37 @@ def _trim_rendered_element(img: Image.Image) -> Image.Image:
 
     return img
 
+
+def _has_white_background(img: Image.Image, thresh: int = 245) -> bool:
+    rgb = img.convert("RGB")
+    w, h = rgb.size
+    if w == 0 or h == 0:
+        return False
+    samples = [
+        rgb.getpixel((0, 0)),
+        rgb.getpixel((w - 1, 0)),
+        rgb.getpixel((0, h - 1)),
+        rgb.getpixel((w - 1, h - 1)),
+    ]
+    for r, g, b in samples:
+        if (r + g + b) / 3.0 < thresh:
+            return False
+    return True
+
+
+def _white_to_transparent(img: Image.Image, thresh: int = 12) -> Image.Image:
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
+    rgb = img.convert("RGB")
+    white = Image.new("RGB", rgb.size, (255, 255, 255))
+    diff = ImageChops.difference(rgb, white).convert("L")
+    # keep non-white pixels (diff > thresh)
+    mask = diff.point(lambda x: 0 if x <= thresh else 255)
+    alpha = img.split()[-1]
+    new_alpha = ImageChops.multiply(alpha, mask)
+    img.putalpha(new_alpha)
+    return img
+
 def _compute_tgt_scale_from_contour(contour: list[tuple[float, float]]) -> float:
     bb = _bbox(contour)
     return max(bb.width, bb.height)
@@ -138,7 +169,7 @@ def main() -> None:
     )
     parser.add_argument(
         '--out-dir',
-        default=str(Path(__file__).resolve().parent / 'result' / 'predictions_test_render'),
+        default=str(Path(__file__).resolve().parent / 'result' / 'predictions_test'),
         help='Output directory (default mode: one PDF per sample).',
     )
     parser.add_argument(
@@ -172,9 +203,14 @@ def main() -> None:
     )
     
     parser.add_argument(
+        "--trim-white",
+        action="store_true",
+        help="Enable trimming white/transparent margins in element PDFs.",
+    )
+    parser.add_argument(
         "--no-trim-white",
         action="store_true",
-        help="Disable trimming white/transparent margins in element PDFs.",
+        help="Disable trimming white/transparent margins in element PDFs (overrides --trim-white).",
     )
     parser.add_argument(
         "--render-dpi",
@@ -196,6 +232,17 @@ def main() -> None:
         action="store_true",
         default=True,
         help="Disable applying predicted rotation to element PDFs (debug).",
+    )
+    parser.add_argument(
+        "--draw-axes",
+        action="store_true",
+        help="Draw coordinate axes with ticks/labels for debugging.",
+    )
+    parser.add_argument(
+        "--tick-step",
+        type=float,
+        default=100.0,
+        help="Axis tick step in the same units as json coordinates.",
     )
     parser.add_argument(
         "--theta-sign",
@@ -284,14 +331,61 @@ def main() -> None:
             y_rel = float(y - bb.min_y)
             return (margin + x_rel, margin + (height - y_rel))
 
-        # Draw boundary as a vector polyline.
+        # Precompute boundary polyline and clipping mask.
         boundary_pts = [to_page_xy(x, y) for x, y in contour]
         if boundary_pts and boundary_pts[0] != boundary_pts[-1]:
             boundary_pts.append(boundary_pts[0])
-        shape = page.new_shape()
-        shape.draw_polyline(boundary_pts)
-        shape.finish(color=(0, 0, 0), width=1.0)
-        shape.commit()
+
+        page_scale = float(args.embed_dpi) / 72.0
+        page_px_w = max(1, int(round(page.rect.width * page_scale)))
+        page_px_h = max(1, int(round(page.rect.height * page_scale)))
+        mask_full = Image.new("L", (page_px_w, page_px_h), 0)
+        if boundary_pts:
+            poly_px = [(x * page_scale, y * page_scale) for x, y in boundary_pts]
+            ImageDraw.Draw(mask_full).polygon(poly_px, fill=255)
+
+        # Optional: draw axes and ticks (in original json coordinates).
+        if args.draw_axes:
+            axis_shape = page.new_shape()
+            x0, y0 = to_page_xy(bb.min_x, bb.min_y)
+            x1, _ = to_page_xy(bb.max_x, bb.min_y)
+            x2, y2 = to_page_xy(bb.min_x, bb.max_y)
+            axis_shape.draw_line((x0, y0), (x1, y0))
+            axis_shape.draw_line((x0, y0), (x2, y2))
+            axis_shape.finish(color=(0.4, 0.4, 0.4), width=0.7)
+            axis_shape.commit()
+
+            tick_step = float(args.tick_step)
+            tick_len = 6.0
+            tick_shape = page.new_shape()
+            # X ticks
+            if tick_step > 0:
+                xv = math.floor(bb.min_x / tick_step) * tick_step
+                while xv <= bb.max_x + 1e-6:
+                    px, py = to_page_xy(xv, bb.min_y)
+                    tick_shape.draw_line((px, py), (px, py + tick_len))
+                    page.insert_text(
+                        (px + 2, py + tick_len + 4),
+                        f"{xv:.0f}",
+                        fontsize=6,
+                        color=(0.4, 0.4, 0.4),
+                    )
+                    xv += tick_step
+            # Y ticks
+            if tick_step > 0:
+                yv = math.floor(bb.min_y / tick_step) * tick_step
+                while yv <= bb.max_y + 1e-6:
+                    px, py = to_page_xy(bb.min_x, yv)
+                    tick_shape.draw_line((px, py), (px - tick_len, py))
+                    page.insert_text(
+                        (px - tick_len - 20, py + 2),
+                        f"{yv:.0f}",
+                        fontsize=6,
+                        color=(0.4, 0.4, 0.4),
+                    )
+                    yv += tick_step
+            tick_shape.finish(color=(0.4, 0.4, 0.4), width=0.5)
+            tick_shape.commit()
 
         # Title text (metadata)
         src_json = rec.get("src_json")
@@ -325,11 +419,20 @@ def main() -> None:
         if len(logo_levels) < max_len:
             logo_levels = list(logo_levels) + [-1] * (max_len - len(logo_levels))
 
-        order = list(range(max_len))
-        if args.logo_order == "asc":
-            order = sorted(order, key=lambda i: (_lvl(logo_levels[i]), i))
-        else:
-            order = sorted(order, key=lambda i: (-_lvl(logo_levels[i]), i))
+        element_meta = {}
+        for i in range(max_len):
+            if float(valids[i]) <= 0.0:
+                continue
+            if not pdf_paths[i]:
+                continue
+            vals = preds[i]
+            w = float(vals[2]) * tgt_scale / NORM_RANGE
+            h = float(vals[3]) * tgt_scale / NORM_RANGE
+            area = abs(w * h)
+            element_meta[i] = (area, w, h)
+
+        # Sort by area: large -> bottom (draw first), small -> top (draw later)
+        order = sorted(element_meta.keys(), key=lambda i: (-element_meta[i][0], i))
 
         # Render each element and paste.
         for i in order:
@@ -365,8 +468,14 @@ def main() -> None:
             # Rasterize base PDF page (cached) then resize/rotate to match (w,h,theta).
             base_img = _render_pdf_first_page(str(pdf_path), int(args.render_dpi))
 
-            if not args.no_trim_white:
+            # Disable trimming by default; only trim when explicitly enabled.
+            do_trim = args.trim_white and not args.no_trim_white
+            if do_trim:
                 base_img = _trim_rendered_element(base_img)
+
+            # If the element has a white background, make it transparent.
+            if _has_white_background(base_img):
+                base_img = _white_to_transparent(base_img)
 
             # Convert desired (w,h) in page-units into pixels under embed_dpi.
             px_w = max(1, int(round(w * float(args.embed_dpi) / 72.0)))
@@ -380,6 +489,18 @@ def main() -> None:
 
             cx_p, cy_p = to_page_xy(cx, cy)
             rect = fitz.Rect(cx_p - ins_w / 2, cy_p - ins_h / 2, cx_p + ins_w / 2, cy_p + ins_h / 2)
+            # Clip by contour mask: crop mask to element rect, apply as alpha.
+            if img.mode != "RGBA":
+                img = img.convert("RGBA")
+            x0_px = int(round(rect.x0 * page_scale))
+            y0_px = int(round(rect.y0 * page_scale))
+            x1_px = int(round(rect.x1 * page_scale))
+            y1_px = int(round(rect.y1 * page_scale))
+            mask_crop = mask_full.crop((x0_px, y0_px, x1_px, y1_px))
+            if mask_crop.size != img.size:
+                mask_crop = mask_crop.resize(img.size, resample=Image.NEAREST)
+            alpha = img.split()[-1]
+            img.putalpha(ImageChops.multiply(alpha, mask_crop))
             page.insert_image(rect, stream=_pil_to_png_bytes(img), overlay=True)
 
             if args.draw_box:
@@ -410,6 +531,13 @@ def main() -> None:
                 box_shape.draw_polyline(poly)
                 box_shape.finish(color=(0, 0, 1), width=0.7)
                 box_shape.commit()
+
+        # Draw boundary as a vector polyline on top.
+        if boundary_pts:
+            shape = page.new_shape()
+            shape.draw_polyline(boundary_pts)
+            shape.finish(color=(0, 0, 0), width=1.0)
+            shape.commit()
 
         if out_doc is None:
             src_tag = str(src_size) if src_size else 'NA'
