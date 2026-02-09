@@ -36,6 +36,14 @@ def main():
         default=512,
         help="Base size for SDF maps (default: 512).",
     )
+    parser.add_argument(
+        "--old-xlsx",
+        default=None,
+        help=(
+            "Optional: old xlsx for test split. If provided, step 7 uses "
+            "build_pair_splits_oldxlsx.py and assigns old shapes to test."
+        ),
+    )
     args = parser.parse_args()
 
     pattern_root = Path(args.pattern_root)
@@ -57,7 +65,16 @@ def main():
     run_step([py, str(here / "build_element_embeddings.py"), str(xlsx_path), "--root", str(pattern_root)], "4) build element embeddings")
     run_step([py, str(here / "analyze_shape_element_mapping.py"), str(xlsx_path), "--root", str(pattern_root)], "5) build shape/size mapping")
     run_step([py, str(here / "compute_piece_size_scales.py")], "6) compute size scale factors")
-    run_step([py, str(here / "build_pair_splits.py")], "7) build pair splits")
+    if args.old_xlsx:
+        old_xlsx = Path(args.old_xlsx)
+        if not old_xlsx.is_file():
+            raise SystemExit(f"old_xlsx not found: {old_xlsx}")
+        run_step(
+            [py, str(here / "build_pair_splits_oldxlsx.py"), "--old-xlsx", str(old_xlsx)],
+            "7) build pair splits (old xlsx -> test)",
+        )
+    else:
+        run_step([py, str(here / "build_pair_splits.py")], "7) build pair splits")
     run_step([py, str(here / "build_sdf_maps.py"), "--base", str(args.sdf_base)], "8) build SDF maps")
 
     print("\nAll preprocessing steps completed.")

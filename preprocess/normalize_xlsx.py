@@ -11,6 +11,8 @@ COL_X = 11
 COL_Y = 12
 COL_W = 13
 COL_H = 14
+COL_SCALE_X = 15  # column O
+COL_SCALE_Y = 16  # column P
 COL_SCALE = 37
 NORM_RANGE = 10.0
 
@@ -76,14 +78,24 @@ def process_sheet(ws, root: Path):
         y = to_float(ws.cell(row=row, column=COL_Y).value)
         w = to_float(ws.cell(row=row, column=COL_W).value)
         h = to_float(ws.cell(row=row, column=COL_H).value)
+        sx = to_float(ws.cell(row=row, column=COL_SCALE_X).value)
+        sy = to_float(ws.cell(row=row, column=COL_SCALE_Y).value)
         if None in (x, y, w, h):
             print(f"row {row}: invalid x/y/w/h", file=sys.stderr)
             continue
+        if sx is None:
+            sx = 1.0
+        if sy is None:
+            sy = 1.0
 
-        x = (x + w / 2.0) / scale * NORM_RANGE
-        y = (y + h / 2.0) / scale * NORM_RANGE
-        w = w / scale * NORM_RANGE
-        h = h / scale * NORM_RANGE
+        # apply per-element axis scaling to size only (x/y not scaled)
+        w_scaled = w * sx
+        h_scaled = h * sy
+
+        x = (x + w_scaled / 2.0) / scale * NORM_RANGE
+        y = (y + h_scaled / 2.0) / scale * NORM_RANGE
+        w = w_scaled / scale * NORM_RANGE
+        h = h_scaled / scale * NORM_RANGE
 
         ws.cell(row=row, column=COL_X).value = x
         ws.cell(row=row, column=COL_Y).value = y

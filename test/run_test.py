@@ -37,7 +37,7 @@ def main():
     )
     parser.add_argument(
         "--ckpt",
-        default=str(Path(__file__).resolve().parents[1] / "result"  / "best.pt"),
+        default=str(Path(__file__).resolve().parents[1] / "result"  / "model" / "best.pt"),
         help="Checkpoint path",
     )
     parser.add_argument(
@@ -49,8 +49,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--d-model", type=int, default=384)
-    parser.add_argument("--num-layers", type=int, default=6)
+    parser.add_argument("--d-model", type=int, default=256)
+    parser.add_argument("--num-layers", type=int, default=4)
     parser.add_argument("--nhead", type=int, default=8)
     parser.add_argument(
         "--out-dir",

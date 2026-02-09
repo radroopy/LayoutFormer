@@ -534,15 +534,15 @@ def main():
     parser.add_argument("--lambda-shape", type=float, default=1.0)
     parser.add_argument("--lambda-reg", type=float, default=1.0)
     parser.add_argument("--max-elements", type=int, default=20)
-    parser.add_argument("--d-model", type=int, default=384)
-    parser.add_argument("--num-layers", type=int, default=6)
+    parser.add_argument("--d-model", type=int, default=256)
+    parser.add_argument("--num-layers", type=int, default=4)
     parser.add_argument("--nhead", type=int, default=8)
     parser.add_argument(
         "--log-dim-loss",
         dest="log_dim_loss",
         action="store_true",
-        default=True,
-        help="Use log1p loss for w/h (default: on).",
+        default=False,
+        help="Use log1p loss for w/h (default: off).",
     )
     parser.add_argument(
         "--no-log-dim-loss",

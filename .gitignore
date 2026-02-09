@@ -1,0 +1,22 @@
+# 改动位置：.gitignore 末尾追加
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 训练产物/模型权重
+result/
+result/model/
+*.pt
+*.pth
+*.ckpt
+
+# 测试输出（如果你不想提交测试结果）
+test/result/
+
+# Office 临时文件
+~$*.xlsx
+
+# 临时补丁/杂项
+*.patch
+how --name-only --oneline*
