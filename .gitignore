@@ -20,3 +20,6 @@ test/result/
 # 临时补丁/杂项
 *.patch
 how --name-only --oneline*
+# Do not commit datasets / generated artifacts
+data/
+train/pair_splits.json
