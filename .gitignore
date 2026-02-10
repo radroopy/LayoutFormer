@@ -10,9 +10,12 @@ result/model/
 *.pt
 *.pth
 *.ckpt
+*.xlsx
 
 # 测试输出（如果你不想提交测试结果）
 test/result/
+/data
+/reslut
 
 # Office 临时文件
 ~$*.xlsx
