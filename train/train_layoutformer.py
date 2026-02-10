@@ -86,22 +86,24 @@ def load_pattern_points(npz_path: Path):
     return points_embed, mapping
 
 
-# 读取元素嵌入：按 json 聚合元素，并保持与 pdf_path + element_id 的稳定排序
+# 读取元素嵌入：按 shape_id + json 聚合元素，并保持与 pdf_path + element_id 的稳定排序
 def load_elements(npz_path: Path):
     """
-    读取 element（图案/标注）的预处理结果，并按 pattern json 聚合成布局。
+    读取 element（图案/标注）的预处理结果，并按 shape_id + pattern json 聚合成布局。
     
     输入：elements_embed.npz（由 build_element_embeddings.py 生成）
       - labels: 每个 element 的 type_id（整数）
       - center_x/center_y/w/h/sin/cos: (N,) 几何信息（已经归一化）
       - element_embed: (N, 4L) 只包含 x/y 的 Fourier 特征（用于 emb_pos 分支）
       - pattern_json_paths: (N,) 每个 element 属于哪个 pattern piece(json)
+      - shape_ids: (N,) 每个 element 属于哪个 shape（样品号+style+形状名）
       - pdf_paths + element_ids: 用来给 element 做稳定排序（跨尺码对齐）
     
     输出：layouts: dict
-      key: pattern_json_path
+      key: (shape_id, pattern_json_path)
       value: {
         pdf_paths: list[str]  # 稳定排序后的 pdf 序列（用于跨尺码对齐）
+        element_ids: list[str]
         labels: np.ndarray (Ni,) int64
         geom: np.ndarray (Ni, 6) float32  # [x,y,w,h,sin,cos]
         pos_embed: np.ndarray (Ni, 4L) float32  # 位置 Fourier 特征
@@ -113,6 +115,9 @@ def load_elements(npz_path: Path):
     element_ids = [to_str(v) for v in data["element_ids"].tolist()]
     pdf_paths = [to_str(v) for v in data["pdf_paths"].tolist()]
     pattern_json_paths = [to_str(v) for v in data["pattern_json_paths"].tolist()]
+    if "shape_ids" not in data:
+        raise SystemExit("elements_embed.npz missing shape_ids; rerun build_element_embeddings.py")
+    shape_ids = [to_str(v) for v in data["shape_ids"].tolist()]
     labels = data["labels"].astype(np.int64)
     center_x = data["center_x"].astype(np.float32)
     center_y = data["center_y"].astype(np.float32)
@@ -126,16 +131,21 @@ def load_elements(npz_path: Path):
         logo_level = np.full(labels.shape[0], -1, dtype=np.int64)
     element_embed = data["element_embed"].astype(np.float32)
 
-    by_json = {}
+    by_key = {}
     for idx, json_path in enumerate(pattern_json_paths):
-        by_json.setdefault(json_path, []).append(idx)
+        shape_id = shape_ids[idx]
+        if shape_id is None or str(shape_id).strip() == "":
+            raise ValueError(f"missing shape_id for element {element_ids[idx]} ({json_path})")
+        key = (shape_id, json_path)
+        by_key.setdefault(key, []).append(idx)
 
     layouts = {}
-    for json_path, idxs in by_json.items():
+    for (shape_id, json_path), idxs in by_key.items():
         sorted_idxs = sorted(idxs, key=lambda i: (pdf_paths[i], element_ids[i]))
-        layouts[json_path] = {
+        layouts[(shape_id, json_path)] = {
             "indices": sorted_idxs,
             "pdf_paths": [pdf_paths[i] for i in sorted_idxs],
+            "element_ids": [element_ids[i] for i in sorted_idxs],
             "labels": labels[sorted_idxs],
             "geom": np.stack(
                 [
@@ -154,10 +164,10 @@ def load_elements(npz_path: Path):
     return layouts
 
 
-# 读取 size_scale_factors.json，构建 src_json -> tgt_json -> (scale_w, scale_h)
+# 读取 size_scale_factors.json，构建 shape_id -> src_json -> tgt_json -> (scale_w, scale_h)
 def build_scale_lookup(scale_json_path: Path):
     """
-    读取 size_scale_factors.json，构建 src_json -> tgt_json -> (scale_w, scale_h)。
+    读取 size_scale_factors.json，构建 shape_id -> src_json -> tgt_json -> (scale_w, scale_h)。
     
     scale_w / scale_h 的计算方式来自你给的公式：
       W_A = max(xA) - min(xA), H_A = max(yA) - min(yA)
@@ -169,16 +179,55 @@ def build_scale_lookup(scale_json_path: Path):
     payload = json.loads(scale_json_path.read_text(encoding="utf-8"))
     results = payload.get("results", {})
     lookup = {}
-    for base_json, info in results.items():
-        sizes = info.get("sizes", {})
-        for _, entry in sizes.items():
-            tgt_json = entry["json"]
-            lookup.setdefault(base_json, {})[tgt_json] = (
-                float(entry["scale_w"]),
-                float(entry["scale_h"]),
-            )
+    if not isinstance(results, dict):
+        return lookup
+
+    # 兼容旧格式：results 为 {base_json: {sizes: {...}}}
+    old_format = bool(results) and all(
+        isinstance(v, dict) and "sizes" in v for v in results.values()
+    )
+    if old_format:
+        for base_json, info in results.items():
+            sizes = info.get("sizes", {})
+            for _, entry in sizes.items():
+                tgt_json = entry["json"]
+                lookup.setdefault(base_json, {})[tgt_json] = (
+                    float(entry["scale_w"]),
+                    float(entry["scale_h"]),
+                )
+        return {"__all__": lookup}
+
+    # 新格式：results 为 {shape_id: {base_json: {sizes: {...}}}}
+    for shape_id, shape_results in results.items():
+        if not isinstance(shape_results, dict):
+            continue
+        for base_json, info in shape_results.items():
+            if not isinstance(info, dict):
+                continue
+            sizes = info.get("sizes", {})
+            for _, entry in sizes.items():
+                tgt_json = entry["json"]
+                lookup.setdefault(shape_id, {}).setdefault(base_json, {})[tgt_json] = (
+                    float(entry["scale_w"]),
+                    float(entry["scale_h"]),
+                )
     return lookup
 
+
+def _label_range(layouts: dict) -> tuple[int | None, int | None]:
+    min_label = None
+    max_label = None
+    for layout in layouts.values():
+        labels = layout.get("labels")
+        if labels is None or labels.size == 0:
+            continue
+        lmin = int(labels.min())
+        lmax = int(labels.max())
+        if min_label is None or lmin < min_label:
+            min_label = lmin
+        if max_label is None or lmax > max_label:
+            max_label = lmax
+    return min_label, max_label
 
 
 
@@ -317,12 +366,13 @@ def compute_losses(pred, gt, mask, sdf_maps, sdf_hw, log_dim=False, log_pos=Fals
     return l_pos, l_dim, l_rot, l_reg, l_shape
 
 
-# 数据集：根据 pair_splits 取 (src_json, tgt_json) 的布局与边界嵌入
+# 数据集：根据 pair_splits 取 (shape_id, src_json, tgt_json) 的布局与边界嵌入
 class PairDataset(Dataset):
     """
     PairDataset：每条样本是一对布局 (Source A -> Target B)。
     
     样本来自 pair_splits.json 的一个 entry，包含：
+      - shape_id: 形状分组 ID（样品号+style+形状名）
       - src_json / tgt_json: 同一 piece 的不同尺码 json 路径
       - src_size / tgt_size: 尺码名（如 M -> XL）
     
@@ -356,10 +406,10 @@ class PairDataset(Dataset):
         """
         参数说明：
           pairs: list[dict]，pair_splits.json 中的样本列表
-          layouts: dict，由 load_elements() 构建的 {json -> layout} 映射
+          layouts: dict，由 load_elements() 构建的 {(shape_id, json) -> layout} 映射
           boundary_embed: np.ndarray (num_pieces,K,4L)，所有 json 的边界嵌入表
           boundary_index: dict {json -> index}，用于从 boundary_embed 里取某个 json 的 Kx4L
-          scale_lookup: dict {src_json -> {tgt_json -> (scale_w,scale_h)}}
+          scale_lookup: dict {shape_id -> {src_json -> {tgt_json -> (scale_w,scale_h)}}}
           max_elements: 固定 element token 长度（不足 padding，超过报错）
           strict: 是否强制 src/tgt 元素集合一致（建议训练时保持 True）
           sdf_dir/sdf_ext: SDF 文件根目录与后缀名（L_shape 强制使用，因此必须存在）
@@ -422,7 +472,7 @@ class PairDataset(Dataset):
         取出一条 pair 样本，并组装成模型输入/监督所需的张量。
         
         处理步骤（按代码顺序）：
-          1) 从 pairs[idx] 取 src_json/tgt_json
+          1) 从 pairs[idx] 取 shape_id + src_json/tgt_json
           2) 从 layouts 里取源/目标布局（labels/geom/pos_embed）
           3) strict 模式下检查两边元素是否一一对应（pdf_paths 列表必须相同）
           4) padding 到 max_elements，并生成 valid_mask
@@ -432,19 +482,27 @@ class PairDataset(Dataset):
         """
         # 1) 当前样本是一对同形状不同尺码的有向布局：Source(A) -> Target(B)
         pair = self.pairs[idx]
+        shape_id = pair.get("shape_id")
         src_json = pair["src_json"]
         tgt_json = pair["tgt_json"]
 
-        if src_json not in self.layouts or tgt_json not in self.layouts:
-            raise KeyError(f"missing layout for {src_json} or {tgt_json}")
+        if shape_id is None or str(shape_id).strip() == "":
+            raise KeyError(f"missing shape_id for pair: {pair}")
+        shape_id = str(shape_id).strip()
+        src_key = (shape_id, src_json)
+        tgt_key = (shape_id, tgt_json)
 
-        src_layout = self.layouts[src_json]
-        tgt_layout = self.layouts[tgt_json]
+        if src_key not in self.layouts or tgt_key not in self.layouts:
+            raise KeyError(f"missing layout for shape_id={shape_id} src={src_json} tgt={tgt_json}")
+
+        src_layout = self.layouts[src_key]
+        tgt_layout = self.layouts[tgt_key]
 
         # strict=True：要求 src/tgt 的元素序列严格一致（按 pdf_paths 对齐），否则无法做逐元素监督
         if self.strict and src_layout["pdf_paths"] != tgt_layout["pdf_paths"]:
             raise ValueError(
                 "element set mismatch between source and target\n"
+                f"shape_id={shape_id}\n"
                 f"src={src_json}\n"
                 f"tgt={tgt_json}\n"
             )
@@ -474,9 +532,14 @@ class PairDataset(Dataset):
         tgt_bnd = self.boundary_embed[self.boundary_index[tgt_json]]
 
         # 6) 读取尺度因子 (scale_w, scale_h)：用于构建 Scale Token，并广播加到 Target boundary tokens 上
-        scale_entry = self.scale_lookup.get(src_json, {}).get(tgt_json)
+        shape_lookup = self.scale_lookup.get(shape_id)
+        if shape_lookup is None:
+            shape_lookup = self.scale_lookup.get("__all__")
+        if shape_lookup is None:
+            raise KeyError(f"missing scale lookup for shape_id={shape_id}")
+        scale_entry = shape_lookup.get(src_json, {}).get(tgt_json)
         if scale_entry is None:
-            raise KeyError(f"missing scale factor for {src_json} -> {tgt_json}")
+            raise KeyError(f"missing scale factor for shape_id={shape_id} {src_json} -> {tgt_json}")
         scale_factors = np.array(scale_entry, dtype=np.float32)
 
         # 7) 加载目标 SDF (1,H,W)：用于 L_shape；同时记录原始 (H,W)，batch 内 collate 再做 padding
@@ -517,9 +580,9 @@ def main():
         default=str(Path(__file__).resolve().parents[1] / "data"),
         help="Data directory",
     )
-    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=2000)
-    parser.add_argument("--eval-interval", type=int, default=5, help="Evaluate every N epochs")
+    parser.add_argument("--eval-interval", type=int, default=10, help="Evaluate every N epochs")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -533,7 +596,7 @@ def main():
     parser.add_argument("--lambda-rot", type=float, default=1.0)
     parser.add_argument("--lambda-shape", type=float, default=1.0)
     parser.add_argument("--lambda-reg", type=float, default=1.0)
-    parser.add_argument("--max-elements", type=int, default=20)
+    parser.add_argument("--max-elements", type=int, default=40)
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--num-layers", type=int, default=4)
     parser.add_argument("--nhead", type=int, default=8)
@@ -571,7 +634,7 @@ def main():
 
     # 数据加载：
     # 1) pattern_points_embed.npz 提供每个 json 的边界嵌入 (K,4L)
-    # 2) elements_embed.npz 提供每个 json 的元素信息（type/几何/pos_embed）
+    # 2) elements_embed.npz 提供每个 shape+json 的元素信息（type/几何/pos_embed）
     # 3) size_scale_factors.json 提供 src->tgt 的缩放因子 (scale_w, scale_h)
     # 4) pair_splits.json 决定训练/验证/测试的有向对样本
     data_dir = Path(args.data_dir)
@@ -585,7 +648,7 @@ def main():
     scale_lookup = build_scale_lookup(scale_json)
 
     vocab = json.loads(type_vocab.read_text(encoding="utf-8"))
-    num_types = len(vocab)
+    num_types = int(vocab.get("num_types", len(vocab.get("type_to_id", {}))))
 
     splits = json.loads(Path(args.split).read_text(encoding="utf-8"))
     train_pairs = splits["splits"][args.split_name]
@@ -597,6 +660,12 @@ def main():
     sdf_dir = Path(args.sdf_dir) if args.sdf_dir else None
     if sdf_dir is None or not sdf_dir.is_dir():
         raise SystemExit("sdf-dir is required and must exist (L_shape is mandatory)")
+
+    min_label, max_label = _label_range(layouts)
+    if min_label is not None and (min_label < 0 or max_label >= num_types):
+        raise SystemExit(
+            f"type id out of range: min={min_label} max={max_label} num_types={num_types}"
+        )
 
     train_ds = PairDataset(
         train_pairs,

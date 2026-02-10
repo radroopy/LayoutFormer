@@ -33,6 +33,30 @@ def bbox_from_points(points):
     return min_x, min_y, max_x, max_y
 
 
+def _is_size_map(obj) -> bool:
+    if not isinstance(obj, dict):
+        return False
+    for v in obj.values():
+        if isinstance(v, dict):
+            return False
+    return True
+
+
+def normalize_lookup(payload: dict) -> tuple[dict, str]:
+    """
+    Normalize lookup into {shape_id: {base_json: size_map}}.
+    - legacy: {base_json: size_map} -> "__all__"
+    - new: {shape_id: {base_json: size_map}}
+    """
+    if not isinstance(payload, dict):
+        return {}, "invalid"
+    if isinstance(payload.get("lookup"), dict):
+        payload = payload["lookup"]
+    if payload and all(_is_size_map(v) for v in payload.values()):
+        return {"__all__": payload}, "legacy"
+    return payload, "shape"
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Compute per-piece size scale factors using contour points (real-world coords)."
@@ -66,65 +90,73 @@ def main():
     out_path = Path(args.out) if args.out else project_root / "data" / "size_scale_factors.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    lookup = json.loads(lookup_path.read_text(encoding="utf-8"))
+    lookup_payload = json.loads(lookup_path.read_text(encoding="utf-8"))
+    lookup, lookup_mode = normalize_lookup(lookup_payload)
 
     results = {}
     errors = []
-    for base_json, size_map in lookup.items():
-        if not isinstance(size_map, dict) or not size_map:
+    for shape_id, per_shape in lookup.items():
+        if not isinstance(per_shape, dict) or not per_shape:
             continue
-
-        base_path = resolve_path(project_root, root, base_json)
-        if not base_path.exists():
-            errors.append(f"base json not found: {base_json}")
-            continue
-
-        try:
-            base_points = load_contour_points(base_path)
-            min_x, min_y, max_x, max_y = bbox_from_points(base_points)
-            base_w = max_x - min_x
-            base_h = max_y - min_y
-            if base_w <= 0 or base_h <= 0:
-                raise ValueError("invalid bbox")
-        except Exception as exc:
-            errors.append(f"base {base_json} ({exc})")
-            continue
-
-        per_size = {}
-        for size, json_rel in size_map.items():
-            json_path = resolve_path(project_root, root, json_rel)
-            if not json_path.exists():
-                errors.append(f"{base_json}: json not found: {json_rel}")
+        shape_results = {}
+        for base_json, size_map in per_shape.items():
+            if not isinstance(size_map, dict) or not size_map:
                 continue
+
+            base_path = resolve_path(project_root, root, base_json)
+            if not base_path.exists():
+                errors.append(f"{shape_id}: base json not found: {base_json}")
+                continue
+
             try:
-                points = load_contour_points(json_path)
-                min_x, min_y, max_x, max_y = bbox_from_points(points)
-                width = max_x - min_x
-                height = max_y - min_y
-                if width <= 0 or height <= 0:
+                base_points = load_contour_points(base_path)
+                min_x, min_y, max_x, max_y = bbox_from_points(base_points)
+                base_w = max_x - min_x
+                base_h = max_y - min_y
+                if base_w <= 0 or base_h <= 0:
                     raise ValueError("invalid bbox")
             except Exception as exc:
-                errors.append(f"{base_json}: {json_rel} ({exc})")
+                errors.append(f"{shape_id}: base {base_json} ({exc})")
                 continue
 
-            per_size[size] = {
-                "json": json_rel,
-                "width": float(width),
-                "height": float(height),
-                "scale_w": float(width / base_w),
-                "scale_h": float(height / base_h),
-            }
+            per_size = {}
+            for size, json_rel in size_map.items():
+                json_path = resolve_path(project_root, root, json_rel)
+                if not json_path.exists():
+                    errors.append(f"{shape_id}: {base_json}: json not found: {json_rel}")
+                    continue
+                try:
+                    points = load_contour_points(json_path)
+                    min_x, min_y, max_x, max_y = bbox_from_points(points)
+                    width = max_x - min_x
+                    height = max_y - min_y
+                    if width <= 0 or height <= 0:
+                        raise ValueError("invalid bbox")
+                except Exception as exc:
+                    errors.append(f"{shape_id}: {base_json}: {json_rel} ({exc})")
+                    continue
 
-        results[base_json] = {
-            "base_json": base_json,
-            "base_width": float(base_w),
-            "base_height": float(base_h),
-            "sizes": per_size,
-        }
+                per_size[size] = {
+                    "json": json_rel,
+                    "width": float(width),
+                    "height": float(height),
+                    "scale_w": float(width / base_w),
+                    "scale_h": float(height / base_h),
+                }
+
+            shape_results[base_json] = {
+                "base_json": base_json,
+                "base_width": float(base_w),
+                "base_height": float(base_h),
+                "sizes": per_size,
+            }
+        if shape_results:
+            results[shape_id] = shape_results
 
     payload = {
         "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "lookup": str(lookup_path),
+        "lookup_mode": lookup_mode,
         "json_root": str(root),
         "method": "bbox from contour points (raw json coords); scale relative to each base json",
         "results": results,
@@ -132,7 +164,9 @@ def main():
     }
 
     out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(f"bases: {len(results)}")
+    base_count = sum(len(v) for v in results.values())
+    print(f"shapes: {len(results)}")
+    print(f"bases: {base_count}")
     print(f"errors: {len(errors)}")
     print(f"output: {out_path}")
     return 0

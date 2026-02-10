@@ -28,6 +28,8 @@ from normalize_xlsx import process_sheet, resolve_json_path, COL_JSON, COL_X, CO
 from ly import FourierFeatureEncoder
 
 COL_ID = 1
+COL_SAMPLE = 2
+COL_SHAPE = 4
 COL_PDF = 6
 COL_LOGO = 9
 
@@ -96,6 +98,17 @@ def parse_column(value):
         return column_index_from_string(text.upper())
     except Exception:
         return None
+
+
+def extract_style_from_json(json_rel: str):
+    parts = Path(json_rel).parts
+    if len(parts) < 3:
+        return None
+    return parts[-3]
+
+
+def build_element_uid(sample_id: str, element_id: str) -> str:
+    return f"{sample_id}::{element_id}"
 
 
 def detect_type_col(ws):
@@ -182,6 +195,14 @@ def main():
         "--type-col",
         help="Type column (letter or 1-based index). If omitted, will try header names.",
     )
+    parser.add_argument(
+        "--sample-col",
+        help="Sample id column (letter or 1-based index). Default: B.",
+    )
+    parser.add_argument(
+        "--shape-col",
+        help="Shape name column (letter or 1-based index). Default: D.",
+    )
     parser.add_argument("--num-bands", type=int, default=10, help="Fourier bands (L).")
     parser.add_argument("--max-freq", type=float, default=10.0, help="Max freq (kept for API).")
     parser.add_argument(
@@ -224,6 +245,12 @@ def main():
         type_col = detect_type_col(ws)
     if type_col is None:
         type_col = column_index_from_string("H")
+    sample_col = parse_column(args.sample_col) if args.sample_col else COL_SAMPLE
+    if sample_col is None:
+        sample_col = COL_SAMPLE
+    shape_col = parse_column(args.shape_col) if args.shape_col else COL_SHAPE
+    if shape_col is None:
+        shape_col = COL_SHAPE
 
     rows = []
     types = set()
@@ -233,6 +260,19 @@ def main():
         element_id = ws.cell(row=row, column=COL_ID).value
         if element_id is None or str(element_id).strip() == "":
             continue
+
+        sample_cell = ws.cell(row=row, column=sample_col).value if sample_col else None
+        shape_cell = ws.cell(row=row, column=shape_col).value if shape_col else None
+        if sample_cell is None or str(sample_cell).strip() == "":
+            skipped += 1
+            continue
+        if shape_cell is None or str(shape_cell).strip() == "":
+            skipped += 1
+            continue
+
+        sample_id = str(sample_cell).strip()
+        shape_name_raw = str(shape_cell).strip()
+        element_id_str = str(element_id).strip()
 
         json_cell = ws.cell(row=row, column=COL_JSON).value
         pdf_cell = ws.cell(row=row, column=COL_PDF).value
@@ -264,13 +304,21 @@ def main():
             pdf_path = resolve_json_path(pdf_root, pdf_cell)
             pdf_rel = _make_rel_id(pdf_path, project_root, fallback_root=pdf_root)
 
+        style = extract_style_from_json(json_rel)
+        if style:
+            shape_id = f"{sample_id}-{style}-{shape_name_raw}"
+        else:
+            shape_id = f"{sample_id}-{shape_name_raw}"
+        element_uid = build_element_uid(sample_id, element_id_str)
+
         type_name = str(type_cell).strip()
         types.add(type_name)
 
         rows.append({
-            "element_id": str(element_id).strip(),
+            "element_id": element_uid,
             "pdf_path": pdf_rel,
             "pattern_json": json_rel,
+            "shape_id": shape_id,
             "type_name": type_name,
             "center_x": float(x),
             "center_y": float(y),
@@ -321,12 +369,14 @@ def main():
     element_ids = np.array([r["element_id"] for r in rows], dtype=object)
     pdf_paths = np.array([r["pdf_path"] for r in rows], dtype=object)
     pattern_jsons = np.array([r["pattern_json"] for r in rows], dtype=object)
+    shape_ids = np.array([r["shape_id"] for r in rows], dtype=object)
 
     np.savez(
         out_npz,
         element_ids=element_ids,
         pdf_paths=pdf_paths,
         pattern_json_paths=pattern_jsons,
+        shape_ids=shape_ids,
         labels=labels,
         center_x=center_x,
         center_y=center_y,
@@ -353,9 +403,14 @@ def main():
         "xlsx_source": str(xlsx_path),
         "xlsx_norm": str(norm_path),
         "norm_range": NORM_RANGE,
+        "element_id_format": "sample_id::element_id",
         "type_col": int(type_col),
+        "sample_col": int(sample_col),
+        "shape_col": int(shape_col),
         "columns": {
             "element_id": COL_ID,
+            "sample_id": COL_SAMPLE,
+            "shape_name": COL_SHAPE,
             "pattern_json": COL_JSON,
             "pdf_path": COL_PDF,
             "center_x": COL_X,
@@ -369,6 +424,7 @@ def main():
             "element_ids": "element_ids",
             "pdf_paths": "pdf_paths",
             "pattern_json_paths": "pattern_json_paths",
+            "shape_ids": "shape_ids",
             "labels": "labels",
             "center_x": "center_x",
             "center_y": "center_y",

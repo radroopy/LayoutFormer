@@ -17,9 +17,13 @@ def to_str(x):
 def load_elements(npz_path: Path):
     data = np.load(npz_path, allow_pickle=True)
     elem_ids = [to_str(x) for x in data["element_ids"].tolist()]
+    shape_ids = None
+    if "shape_ids" in data:
+        shape_ids = [to_str(x) for x in data["shape_ids"].tolist()]
     lookup = {}
     lookup_by_pdf_json = {}
     for idx, elem_id in enumerate(elem_ids):
+        shape_id = shape_ids[idx] if shape_ids is not None else None
         entry = {
             "center_x": float(data["center_x"][idx]),
             "center_y": float(data["center_y"][idx]),
@@ -33,10 +37,17 @@ def load_elements(npz_path: Path):
             "pattern_json_path": to_str(data["pattern_json_paths"][idx])
             if "pattern_json_paths" in data
             else None,
+            "shape_id": shape_id,
         }
         lookup[elem_id] = entry
-        key = (entry["pdf_path"], entry["pattern_json_path"])
+        if shape_id:
+            key = (shape_id, entry["pdf_path"], entry["pattern_json_path"])
+        else:
+            key = (entry["pdf_path"], entry["pattern_json_path"])
         lookup_by_pdf_json.setdefault(key, []).append((elem_id, entry))
+        if shape_id:
+            fallback_key = (entry["pdf_path"], entry["pattern_json_path"])
+            lookup_by_pdf_json.setdefault(fallback_key, []).append((elem_id, entry))
     return lookup, lookup_by_pdf_json
 
 
@@ -97,8 +108,16 @@ def main():
             if elem_id and elem_id in elem_lookup:
                 gt = elem_lookup[elem_id]
             else:
-                key = (pdf_paths[i] if i < len(pdf_paths) else None, item.get("tgt_json"))
-                candidates = lookup_by_pdf_json.get(key, [])
+                shape_id = item.get("shape_id")
+                pdf_path = pdf_paths[i] if i < len(pdf_paths) else None
+                if shape_id:
+                    key = (shape_id, pdf_path, item.get("tgt_json"))
+                    candidates = lookup_by_pdf_json.get(key, [])
+                else:
+                    candidates = []
+                if not candidates:
+                    key = (pdf_path, item.get("tgt_json"))
+                    candidates = lookup_by_pdf_json.get(key, [])
                 if candidates:
                     # choose first but record ambiguity if multiple
                     elem_id, gt = candidates[0]

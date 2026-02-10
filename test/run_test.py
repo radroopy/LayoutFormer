@@ -70,7 +70,7 @@ def main():
     scale_lookup = build_scale_lookup(scale_json)
 
     vocab = json.loads(type_vocab.read_text(encoding="utf-8"))
-    num_types = len(vocab)
+    num_types = int(vocab.get("num_types", len(vocab.get("type_to_id", {}))))
 
     splits = json.loads(Path(args.split).read_text(encoding="utf-8"))
     pairs = splits["splits"][args.split_name]
@@ -177,10 +177,11 @@ def main():
                 # element 的顺序来自 elements_embed.npz 的稳定排序 (pdf_path, element_id)。
                 # 因此这里把同样顺序的 pdf_paths 取出来并 pad 到 max_elements，便于你在结果里按索引对齐：
                 #   pdf_paths[i] <-> pred[i]
+                shape_id = pair.get("shape_id")
                 src_json = pair.get("src_json")
-                layout = layouts.get(src_json)
+                layout = layouts.get((shape_id, src_json))
                 if layout is None:
-                    raise KeyError(f"missing layout for {src_json}")
+                    raise KeyError(f"missing layout for shape_id={shape_id} src_json={src_json}")
                 pdf_paths = list(layout.get("pdf_paths", []))
                 element_ids = list(layout.get("element_ids", []))
                 logo_levels = [int(v) if v is not None else None for v in layout.get("logo_level", [])]
