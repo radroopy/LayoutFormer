@@ -53,6 +53,12 @@ def main():
     parser.add_argument("--num-layers", type=int, default=4)
     parser.add_argument("--nhead", type=int, default=8)
     parser.add_argument(
+        "--max-elements",
+        type=int,
+        default=40,
+        help="Maximum number of elements per layout (must match training/checkpoint setting).",
+    )
+    parser.add_argument(
         "--out-dir",
         default=str(Path(__file__).resolve().parent / "result"),
         help="Output directory",
@@ -85,7 +91,7 @@ def main():
         points_embed,
         boundary_index,
         scale_lookup,
-        max_elements=20,
+        max_elements=args.max_elements,
         strict=True,
         sdf_dir=sdf_dir,
         sdf_ext=args.sdf_ext,
@@ -94,7 +100,7 @@ def main():
 
     model = LayoutFormer(
         num_element_types=num_types,
-        max_elements=20,
+        max_elements=args.max_elements,
         d_model=args.d_model,
         nhead=args.nhead,
         num_layers=args.num_layers,

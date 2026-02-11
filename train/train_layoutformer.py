@@ -14,8 +14,11 @@ sys.path.insert(0, str(ROOT))
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 try:
     from torch.utils.tensorboard import SummaryWriter
 except Exception:  # pragma: no cover
@@ -24,6 +27,37 @@ except Exception:  # pragma: no cover
 from models.LayoutFormer import LayoutFormer
 
 NORM_RANGE = 10.0
+
+
+def is_dist_ready() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def get_rank() -> int:
+    if is_dist_ready():
+        return dist.get_rank()
+    return 0
+
+
+def get_world_size() -> int:
+    if is_dist_ready():
+        return dist.get_world_size()
+    return 1
+
+
+def is_main_process() -> bool:
+    return get_rank() == 0
+
+
+def reduce_metrics(values: list[float], device: torch.device) -> list[float]:
+    """
+    Sum-reduce a list of scalar metrics across all processes.
+    Returns reduced sums as Python floats.
+    """
+    t = torch.tensor(values, device=device, dtype=torch.float64)
+    if is_dist_ready():
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return [float(v) for v in t.tolist()]
 
 
 def safe_torch_save(obj: dict, path: Path):
@@ -632,6 +666,19 @@ def main():
     parser.add_argument("--sdf-ext", default=".npy", help="SDF file extension (default: .npy)")
     args = parser.parse_args()
 
+    # DDP setup (launch with torchrun). Single-process mode remains unchanged.
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world_size_env = int(os.environ.get("WORLD_SIZE", "1"))
+    use_ddp = world_size_env > 1
+    if use_ddp:
+        if not torch.cuda.is_available():
+            raise SystemExit("DDP currently requires CUDA devices.")
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", init_method="env://")
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device(args.device)
+
     # 数据加载：
     # 1) pattern_points_embed.npz 提供每个 json 的边界嵌入 (K,4L)
     # 2) elements_embed.npz 提供每个 shape+json 的元素信息（type/几何/pos_embed）
@@ -655,7 +702,8 @@ def main():
     val_pairs = splits["splits"].get("val", [])
 
     # 训练开始前打印样本数量，便于确认划分/数据是否正确
-    print(f"pairs: train={len(train_pairs)} val={len(val_pairs)} (split_name={args.split_name})")
+    if is_main_process():
+        print(f"pairs: train={len(train_pairs)} val={len(val_pairs)} (split_name={args.split_name})")
 
     sdf_dir = Path(args.sdf_dir) if args.sdf_dir else None
     if sdf_dir is None or not sdf_dir.is_dir():
@@ -690,10 +738,36 @@ def main():
         sdf_ext=args.sdf_ext,
     )
 
-    print(f"dataset: train={len(train_ds)} val={len(val_ds)}")
+    if is_main_process():
+        print(f"dataset: train={len(train_ds)} val={len(val_ds)}")
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=collate_batch)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=collate_batch)
+    train_sampler = None
+    val_sampler = None
+    if use_ddp:
+        train_sampler = DistributedSampler(train_ds, num_replicas=get_world_size(), rank=get_rank(), shuffle=True)
+        val_sampler = DistributedSampler(val_ds, num_replicas=get_world_size(), rank=get_rank(), shuffle=False)
+
+    loader_kwargs = {
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+        "collate_fn": collate_batch,
+    }
+    if args.num_workers > 0:
+        loader_kwargs["pin_memory"] = True
+        loader_kwargs["persistent_workers"] = True
+
+    train_loader = DataLoader(
+        train_ds,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        **loader_kwargs,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        shuffle=False,
+        sampler=val_sampler,
+        **loader_kwargs,
+    )
 
     model = LayoutFormer(
         num_element_types=num_types,
@@ -703,7 +777,10 @@ def main():
         num_layers=args.num_layers,
         boundary_seq_len=points_embed.shape[1],
         fourier_bands=10,
-    ).to(args.device)
+    ).to(device)
+    if use_ddp:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+    model_for_ckpt = model.module if isinstance(model, DDP) else model
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
@@ -712,15 +789,21 @@ def main():
     best_val = math.inf
 
     writer = None
-    if SummaryWriter is None:
-        print("TensorBoard not available: torch.utils.tensorboard is missing.", file=sys.stderr)
-    else:
-        log_dir = Path(args.log_dir)
-        log_dir.mkdir(parents=True, exist_ok=True)
-        run_name = datetime.now().strftime("%Y%m%d-%H%M%S")
-        writer = SummaryWriter(log_dir=str(log_dir / run_name))
+    if is_main_process():
+        if SummaryWriter is None:
+            print("TensorBoard not available: torch.utils.tensorboard is missing.", file=sys.stderr)
+        else:
+            log_dir = Path(args.log_dir)
+            log_dir.mkdir(parents=True, exist_ok=True)
+            run_name = datetime.now().strftime("%Y%m%d-%H%M%S")
+            writer = SummaryWriter(log_dir=str(log_dir / run_name))
 
     for epoch in range(1, args.epochs + 1):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        if val_sampler is not None:
+            val_sampler.set_epoch(epoch)
+
         model.train()
         running = 0.0
         running_pos = 0.0
@@ -728,6 +811,7 @@ def main():
         running_rot = 0.0
         running_reg = 0.0
         running_shape = 0.0
+        train_steps = 0.0
         for batch in train_loader:
             (
                 src_types,
@@ -741,16 +825,16 @@ def main():
                 sdf_maps,
                 sdf_hw,
             ) = batch
-            src_types = src_types.to(args.device)
-            src_geom = src_geom.to(args.device)
-            src_pos = src_pos.to(args.device)
-            src_bnd = src_bnd.to(args.device)
-            tgt_bnd = tgt_bnd.to(args.device)
-            scale_factors = scale_factors.to(args.device)
-            tgt_geom = tgt_geom.to(args.device)
-            valid = valid.to(args.device)
-            sdf_maps = sdf_maps.to(args.device)
-            sdf_hw = sdf_hw.to(args.device)
+            src_types = src_types.to(device)
+            src_geom = src_geom.to(device)
+            src_pos = src_pos.to(device)
+            src_bnd = src_bnd.to(device)
+            tgt_bnd = tgt_bnd.to(device)
+            scale_factors = scale_factors.to(device)
+            tgt_geom = tgt_geom.to(device)
+            valid = valid.to(device)
+            sdf_maps = sdf_maps.to(device)
+            sdf_hw = sdf_hw.to(device)
 
             pred = model(
                 src_types,
@@ -790,8 +874,21 @@ def main():
             loss.backward()
             optimizer.step()
             running += loss.item()
+            train_steps += 1.0
 
-        denom = max(1, len(train_loader))
+        (
+            running,
+            running_pos,
+            running_dim,
+            running_rot,
+            running_shape,
+            running_reg,
+            train_steps,
+        ) = reduce_metrics(
+            [running, running_pos, running_dim, running_rot, running_shape, running_reg, train_steps],
+            device,
+        )
+        denom = max(1.0, train_steps)
         avg_loss = running / denom
         avg_pos = running_pos / denom
         avg_dim = running_dim / denom
@@ -819,6 +916,7 @@ def main():
             val_shape = 0.0
             val_reg = 0.0
             geom_sum = 0.0
+            val_steps = 0.0
             with torch.no_grad():
                 for batch in val_loader:
                     (
@@ -833,16 +931,16 @@ def main():
                         sdf_maps,
                         sdf_hw,
                     ) = batch
-                    src_types = src_types.to(args.device)
-                    src_geom = src_geom.to(args.device)
-                    src_pos = src_pos.to(args.device)
-                    src_bnd = src_bnd.to(args.device)
-                    tgt_bnd = tgt_bnd.to(args.device)
-                    scale_factors = scale_factors.to(args.device)
-                    tgt_geom = tgt_geom.to(args.device)
-                    valid = valid.to(args.device)
-                    sdf_maps = sdf_maps.to(args.device)
-                    sdf_hw = sdf_hw.to(args.device)
+                    src_types = src_types.to(device)
+                    src_geom = src_geom.to(device)
+                    src_pos = src_pos.to(device)
+                    src_bnd = src_bnd.to(device)
+                    tgt_bnd = tgt_bnd.to(device)
+                    scale_factors = scale_factors.to(device)
+                    tgt_geom = tgt_geom.to(device)
+                    valid = valid.to(device)
+                    sdf_maps = sdf_maps.to(device)
+                    sdf_hw = sdf_hw.to(device)
 
                     pred = model(
                         src_types,
@@ -870,8 +968,22 @@ def main():
                     val_shape += l_shape.item()
                     val_reg += l_reg.item()
                     geom_sum += (l_pos + l_dim + l_rot).item()
+                    val_steps += 1.0
 
-            val_denom = max(1, len(val_loader))
+            (
+                val_loss,
+                val_pos,
+                val_dim,
+                val_rot,
+                val_shape,
+                val_reg,
+                geom_sum,
+                val_steps,
+            ) = reduce_metrics(
+                [val_loss, val_pos, val_dim, val_rot, val_shape, val_reg, geom_sum, val_steps],
+                device,
+            )
+            val_denom = max(1.0, val_steps)
             val_loss = val_loss / val_denom
             val_pos = val_pos / val_denom
             val_dim = val_dim / val_denom
@@ -879,14 +991,15 @@ def main():
             val_shape = val_shape / val_denom
             val_reg = val_reg / val_denom
             geom_sum = geom_sum / val_denom
-            print(
-                f"epoch {epoch} train: loss={avg_loss:.6f} pos={avg_pos:.6f} dim={avg_dim:.6f} rot={avg_rot:.6f} "
-                f"shape={avg_shape:.6f} reg={avg_reg:.6f}"
-            )
-            print(
-                f"epoch {epoch} val:   loss={val_loss:.6f} pos={val_pos:.6f} dim={val_dim:.6f} rot={val_rot:.6f} "
-                f"shape={val_shape:.6f} reg={val_reg:.6f} geom_sum={geom_sum:.6f}"
-            )
+            if is_main_process():
+                print(
+                    f"epoch {epoch} train: loss={avg_loss:.6f} pos={avg_pos:.6f} dim={avg_dim:.6f} rot={avg_rot:.6f} "
+                    f"shape={avg_shape:.6f} reg={avg_reg:.6f}"
+                )
+                print(
+                    f"epoch {epoch} val:   loss={val_loss:.6f} pos={val_pos:.6f} dim={val_dim:.6f} rot={val_rot:.6f} "
+                    f"shape={val_shape:.6f} reg={val_reg:.6f} geom_sum={geom_sum:.6f}"
+                )
 
             if writer is not None:
                 writer.add_scalar("val/loss", val_loss, epoch)
@@ -897,25 +1010,27 @@ def main():
                 writer.add_scalar("val/reg", val_reg, epoch)
                 writer.add_scalar("val/geom_sum", geom_sum, epoch)
 
-            ckpt = {
-                "epoch": epoch,
-                "model_state": model.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
-                "val_loss": val_loss,
-                "geom_sum": geom_sum,
-                "args": vars(args),
-            }
-            safe_torch_save(ckpt, save_dir / "last.pt")
-            if val_loss < best_val:
-                best_val = val_loss
-                safe_torch_save(ckpt, save_dir / "best.pt")
+            if is_main_process():
+                ckpt = {
+                    "epoch": epoch,
+                    "model_state": model_for_ckpt.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "val_loss": val_loss,
+                    "geom_sum": geom_sum,
+                    "args": vars(args),
+                }
+                safe_torch_save(ckpt, save_dir / "last.pt")
+                if val_loss < best_val:
+                    best_val = val_loss
+                    safe_torch_save(ckpt, save_dir / "best.pt")
         else:
-            print(
-                f"epoch {epoch} train: loss={avg_loss:.6f} pos={avg_pos:.6f} dim={avg_dim:.6f} rot={avg_rot:.6f} "
-                f"shape={avg_shape:.6f} reg={avg_reg:.6f} (eval skipped)"
-            )
+            if is_main_process():
+                print(
+                    f"epoch {epoch} train: loss={avg_loss:.6f} pos={avg_pos:.6f} dim={avg_dim:.6f} rot={avg_rot:.6f} "
+                    f"shape={avg_shape:.6f} reg={avg_reg:.6f} (eval skipped)"
+                )
 
-        if epoch == 5:
+        if is_main_process() and epoch == 5:
             best_path = save_dir / "best.pt"
             out_5 = save_dir / "5_best.pt"
             if best_path.exists():
@@ -923,7 +1038,7 @@ def main():
             else:
                 ckpt_5 = {
                     "epoch": epoch,
-                    "model_state": model.state_dict(),
+                    "model_state": model_for_ckpt.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
                     "val_loss": val_loss,
                     "geom_sum": geom_sum,
@@ -931,7 +1046,7 @@ def main():
                 }
                 safe_torch_save(ckpt_5, out_5)
 
-        if epoch == 200:
+        if is_main_process() and epoch == 200:
             best_path = save_dir / "best.pt"
             out_200 = save_dir / "200_best.pt"
             if best_path.exists():
@@ -939,7 +1054,7 @@ def main():
             else:
                 ckpt_200 = {
                     "epoch": epoch,
-                    "model_state": model.state_dict(),
+                    "model_state": model_for_ckpt.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
                     "val_loss": val_loss,
                     "geom_sum": geom_sum,
@@ -947,7 +1062,7 @@ def main():
                 }
                 safe_torch_save(ckpt_200, out_200)
 
-        if epoch == 500:
+        if is_main_process() and epoch == 500:
             best_path = save_dir / "best.pt"
             out_500 = save_dir / "500_best.pt"
             if best_path.exists():
@@ -955,7 +1070,7 @@ def main():
             else:
                 ckpt_500 = {
                     "epoch": epoch,
-                    "model_state": model.state_dict(),
+                    "model_state": model_for_ckpt.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
                     "val_loss": val_loss,
                     "geom_sum": geom_sum,
@@ -965,6 +1080,8 @@ def main():
 
     if writer is not None:
         writer.close()
+    if is_dist_ready():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
