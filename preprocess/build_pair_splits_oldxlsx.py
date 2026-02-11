@@ -57,6 +57,40 @@ def load_valid_layouts(npz_path: Path) -> dict | None:
     return valid
 
 
+def load_layout_pdf_sequences(npz_path: Path) -> dict | None:
+    """
+    Build strict layout signatures from elements_embed.npz.
+    Signature preserves duplicate pdf counts by keeping sorted sequence of pdf paths.
+    Key: (shape_id, json_path) -> tuple[pdf_path, ...]
+    """
+    if not npz_path.is_file():
+        return None
+    if np is None:
+        raise SystemExit("numpy is required to read elements_embed.npz")
+    data = np.load(npz_path, allow_pickle=True)
+    required = ("shape_ids", "pattern_json_paths", "pdf_paths", "element_ids")
+    if any(k not in data for k in required):
+        print(f"[WARN] elements_embed missing keys for sequence filter: {npz_path}", file=sys.stderr)
+        return None
+
+    shape_ids = [to_str(v) for v in data["shape_ids"].tolist()]
+    json_paths = [to_str(v) for v in data["pattern_json_paths"].tolist()]
+    pdf_paths = [to_str(v) for v in data["pdf_paths"].tolist()]
+    element_ids = [to_str(v) for v in data["element_ids"].tolist()]
+
+    by_key = {}
+    for idx, (shape_id, json_path) in enumerate(zip(shape_ids, json_paths)):
+        if not shape_id or not json_path:
+            continue
+        by_key.setdefault((shape_id, json_path), []).append(idx)
+
+    seq = {}
+    for key, idxs in by_key.items():
+        sorted_idxs = sorted(idxs, key=lambda i: (pdf_paths[i], element_ids[i]))
+        seq[key] = tuple(pdf_paths[i] for i in sorted_idxs)
+    return seq
+
+
 def load_shape_pdf_map(path: Path) -> dict | None:
     if not path.is_file():
         return None
@@ -199,6 +233,12 @@ def main():
             print(f"[WARN] skip filtering: invalid elements_embed {elements_path}", file=sys.stderr)
         else:
             print(f"[WARN] skip filtering: elements_embed not found {elements_path}", file=sys.stderr)
+    layout_pdf_seq = load_layout_pdf_sequences(elements_path)
+    if layout_pdf_seq is None:
+        if elements_path.is_file():
+            print(f"[WARN] skip sequence filter: invalid elements_embed {elements_path}", file=sys.stderr)
+        else:
+            print(f"[WARN] skip sequence filter: elements_embed not found {elements_path}", file=sys.stderr)
     dropped_jsons = 0
     dropped_shapes = 0
     dropped_shape_reasons = {
@@ -216,6 +256,13 @@ def main():
         else:
             print(f"[WARN] skip pdf filter: shape_element_map not found {shape_elements_path}", file=sys.stderr)
     dropped_pairs = 0
+    dropped_pair_reasons = {
+        "missing_shape_pdfs": 0,
+        "missing_json_pdfs": 0,
+        "pdf_mismatch": 0,
+        "missing_layout_seq": 0,
+        "layout_seq_mismatch": 0,
+    }
 
     splits = {"train": [], "val": [], "test": []}
     shape_stats = {}
@@ -307,6 +354,7 @@ def main():
                     pdfs_by_json = shape_pdf_map.get(shape_id)
                     if not pdfs_by_json:
                         dropped_pairs += 1
+                        dropped_pair_reasons["missing_shape_pdfs"] += 1
                         print(
                             f"[drop] shape={shape_id} src={src_json} tgt={tgt_json} reason=missing_shape_pdfs",
                             file=sys.stderr,
@@ -316,6 +364,7 @@ def main():
                     tgt_pdfs = pdfs_by_json.get(tgt_json)
                     if not src_pdfs or not tgt_pdfs:
                         dropped_pairs += 1
+                        dropped_pair_reasons["missing_json_pdfs"] += 1
                         print(
                             f"[drop] shape={shape_id} src={src_json} tgt={tgt_json} reason=missing_json_pdfs",
                             file=sys.stderr,
@@ -323,9 +372,30 @@ def main():
                         continue
                     if src_pdfs != tgt_pdfs:
                         dropped_pairs += 1
+                        dropped_pair_reasons["pdf_mismatch"] += 1
                         print(
                             f"[drop] shape={shape_id} src={src_json} tgt={tgt_json} "
                             f"reason=pdf_mismatch src_n={len(src_pdfs)} tgt_n={len(tgt_pdfs)}",
+                            file=sys.stderr,
+                        )
+                        continue
+                if layout_pdf_seq is not None:
+                    src_seq = layout_pdf_seq.get((shape_id, src_json))
+                    tgt_seq = layout_pdf_seq.get((shape_id, tgt_json))
+                    if src_seq is None or tgt_seq is None:
+                        dropped_pairs += 1
+                        dropped_pair_reasons["missing_layout_seq"] += 1
+                        print(
+                            f"[drop] shape={shape_id} src={src_json} tgt={tgt_json} reason=missing_layout_seq",
+                            file=sys.stderr,
+                        )
+                        continue
+                    if src_seq != tgt_seq:
+                        dropped_pairs += 1
+                        dropped_pair_reasons["layout_seq_mismatch"] += 1
+                        print(
+                            f"[drop] shape={shape_id} src={src_json} tgt={tgt_json} "
+                            f"reason=layout_seq_mismatch src_n={len(src_seq)} tgt_n={len(tgt_seq)}",
                             file=sys.stderr,
                         )
                         continue
@@ -390,10 +460,12 @@ def main():
         "shape_element_map": str(shape_elements_path),
         "filter_missing_elements": bool(valid_layouts is not None),
         "filter_pdf_pairs": bool(shape_pdf_map is not None),
+        "filter_layout_sequences": bool(layout_pdf_seq is not None),
         "filtered_jsons": dropped_jsons,
         "filtered_shapes": dropped_shapes,
         "filtered_shape_reasons": dropped_shape_reasons,
         "filtered_pairs": dropped_pairs,
+        "filtered_pair_reasons": dropped_pair_reasons,
         "shapes": shape_stats,
         "splits": splits,
     }
@@ -402,7 +474,7 @@ def main():
     print(f"test shapes: {len(test_shapes)}")
     print(f"dropped shapes: {dropped_shapes} reasons={dropped_shape_reasons}")
     print(f"dropped jsons: {dropped_jsons}")
-    print(f"dropped pairs (pdf filter): {dropped_pairs}")
+    print(f"dropped pairs: {dropped_pairs} reasons={dropped_pair_reasons}")
     print(f"train pairs: {len(splits['train'])}")
     print(f"val pairs: {len(splits['val'])}")
     print(f"test pairs: {len(splits['test'])}")

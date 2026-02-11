@@ -178,6 +178,47 @@ def save_vocab(path: Path, type_to_id: dict):
     path.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
 
 
+def dedup_case1_rows(rows: list[dict]) -> tuple[list[dict], dict]:
+    """
+    Case 1 de-duplication:
+      - scope: same (shape_id, pattern_json, pdf_path)
+      - condition: same type_name + same geometry (x,y,w,h)
+      - action: keep last row (later row overrides earlier row)
+
+    Case 2 (same pdf but different geometry) is intentionally preserved.
+    """
+    last_idx_by_sig: dict[tuple, int] = {}
+    replace_count = 0
+
+    for idx, row in enumerate(rows):
+        sig = (
+            row["shape_id"],
+            row["pattern_json"],
+            row["pdf_path"],
+            row["type_name"],
+            round(float(row["center_x"]), 6),
+            round(float(row["center_y"]), 6),
+            round(float(row["w"]), 6),
+            round(float(row["h"]), 6),
+        )
+        if sig in last_idx_by_sig:
+            replace_count += 1
+        last_idx_by_sig[sig] = idx
+
+    keep_indices = sorted(last_idx_by_sig.values())
+    deduped_rows = [rows[i] for i in keep_indices]
+
+    stats = {
+        "input_rows": len(rows),
+        "output_rows": len(deduped_rows),
+        "removed_rows": len(rows) - len(deduped_rows),
+        "replace_count": replace_count,
+        "enabled": True,
+        "rule": "same(shape_id,json,pdf,type,x,y,w,h) -> keep last",
+    }
+    return deduped_rows, stats
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Normalize an xlsx, build element embeddings, and save type vocab + embeddings."
@@ -331,6 +372,8 @@ def main():
         print("No valid rows found.", file=sys.stderr)
         return 3
 
+    rows, dedup_stats = dedup_case1_rows(rows)
+
     # Step 3: build or extend vocab
     vocab = load_vocab(vocab_path)
     if vocab is None:
@@ -393,6 +436,7 @@ def main():
     meta = {
         "count": len(rows),
         "skipped": skipped,
+        "dedup_case1": dedup_stats,
         "num_bands": args.num_bands,
         "embed_dim": int(emb.shape[1]),
         "coord_origin": "bottom-left",
@@ -442,7 +486,7 @@ def main():
     out_meta.write_text(json.dumps(meta, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
 
     print(f"normalized: {norm_path}")
-    print(f"elements: {len(rows)} (skipped {skipped})")
+    print(f"elements: {len(rows)} (skipped {skipped}, dedup_removed {dedup_stats['removed_rows']})")
     print(f"npz: {out_npz}")
     print(f"meta: {out_meta}")
     print(f"vocab: {vocab_path}")
