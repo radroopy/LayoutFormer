@@ -12,6 +12,8 @@ try:
 except ImportError as exc:
     raise SystemExit("openpyxl is required to run this script") from exc
 
+from normalize_xlsx import process_sheet
+
 COL_ID = 1      # A
 COL_SAMPLE = 2  # B (样品号)
 COL_JSON = 5    # E
@@ -54,6 +56,10 @@ def to_float(value):
         except ValueError:
             return None
     return None
+
+
+def geom_equal(a: tuple[float, float, float, float], b: tuple[float, float, float, float], tol: float = 1e-6) -> bool:
+    return all(abs(x - y) <= tol for x, y in zip(a, b))
 
 
 def _make_rel_id(path: Path, project_root: Path, fallback_root: Path | None = None) -> str:
@@ -160,12 +166,16 @@ def main():
 
     wb = openpyxl.load_workbook(xlsx_path)
     ws = wb.active
+    # Use normalized geometry for duplicate-pdf handling (same rule as preprocessing).
+    process_sheet(ws, root)
 
     pattern_map = {}
     shape_groups = {}
     pdf_to_shapes = defaultdict(set)
     size_conflicts = []
     skipped = 0
+    duplicate_overwrites = 0
+    raw_rows = []
 
     for row in range(2, ws.max_row + 1):
         element_id = ws.cell(row=row, column=COL_ID).value
@@ -212,6 +222,7 @@ def main():
         pdf_rel = _make_rel_id(pdf_path, project_root, fallback_root=project_root)
 
         type_name = str(type_cell).strip()
+        geom = (float(x), float(y), float(w), float(h))
 
         style, size, piece = extract_style_size_piece(json_rel)
         if style:
@@ -219,40 +230,101 @@ def main():
         else:
             shape_name = f"{sample_id}-{shape_name_raw}"
 
-        entry = pattern_map.setdefault(json_rel, {
-            "json_path": str(json_path),
-            "pdf_paths": set(),
-            "sample_id": sample_id,
-            "style": style,
-            "size": size,
-            "piece": piece,
-            "shape_name": shape_name,
-            "element_count": 0,
-            "type_counts": Counter(),
-        })
+        raw_rows.append(
+            {
+                "row": row,
+                "sample_id": sample_id,
+                "shape_name": shape_name,
+                "style": style,
+                "size": size,
+                "piece": piece,
+                "json_path": str(json_path),
+                "json_rel": json_rel,
+                "pdf_rel": pdf_rel,
+                "type_name": type_name,
+                "element_uid": element_uid,
+                "geom": geom,
+            }
+        )
+
+    # For the same shape+json+pdf:
+    # 1) same geometry -> keep the later row (overwrite).
+    # 2) different geometry -> keep both rows as separate layout elements.
+    deduped_rows = []
+    layout_pdf_index = {}
+    for item in raw_rows:
+        pdf_rel = item["pdf_rel"]
+        if not pdf_rel:
+            deduped_rows.append(item)
+            continue
+
+        dup_key = (item["shape_name"], item["json_rel"], pdf_rel)
+        candidate_idxs = layout_pdf_index.setdefault(dup_key, [])
+        replaced = False
+        for idx in candidate_idxs:
+            if geom_equal(deduped_rows[idx]["geom"], item["geom"]):
+                deduped_rows[idx] = item
+                duplicate_overwrites += 1
+                replaced = True
+                break
+        if replaced:
+            continue
+
+        deduped_rows.append(item)
+        candidate_idxs.append(len(deduped_rows) - 1)
+
+    for item in deduped_rows:
+        sample_id = item["sample_id"]
+        shape_name = item["shape_name"]
+        style = item["style"]
+        size = item["size"]
+        piece = item["piece"]
+        json_rel = item["json_rel"]
+        json_path_text = item["json_path"]
+        pdf_rel = item["pdf_rel"]
+        type_name = item["type_name"]
+        element_uid = item["element_uid"]
+        row = item["row"]
+
+        entry = pattern_map.setdefault(
+            json_rel,
+            {
+                "json_path": json_path_text,
+                "pdf_paths": set(),
+                "sample_id": sample_id,
+                "style": style,
+                "size": size,
+                "piece": piece,
+                "shape_name": shape_name,
+                "element_count": 0,
+                "type_counts": Counter(),
+            },
+        )
         entry["pdf_paths"].add(pdf_rel)
         entry["element_count"] += 1
-        if type_name is not None:
-            entry["type_counts"][type_name] += 1
+        entry["type_counts"][type_name] += 1
 
-        group = shape_groups.setdefault(shape_name, {
-            "sizes": {},
-            "pdfs": set(),
-            "jsons": set(),
-            "size_elements": {},
-            "json_elements": {},
-        })
+        group = shape_groups.setdefault(
+            shape_name,
+            {
+                "sizes": {},
+                "pdfs": set(),
+                "jsons": set(),
+                "size_elements": {},
+                "json_elements": {},
+            },
+        )
         group["pdfs"].add(pdf_rel)
         group["jsons"].add(json_rel)
         if size:
-            elem_set = group["size_elements"].setdefault(size, set())
-            elem_set.add(element_uid)
+            elem_list = group["size_elements"].setdefault(size, [])
+            elem_list.append(element_uid)
         json_entry = group["json_elements"].setdefault(
-            json_rel, {"pdfs": set(), "elements": set()}
+            json_rel, {"pdfs": [], "elements": []}
         )
         if pdf_rel:
-            json_entry["pdfs"].add(pdf_rel)
-        json_entry["elements"].add(element_uid)
+            json_entry["pdfs"].append(pdf_rel)
+        json_entry["elements"].append(element_uid)
 
         if size:
             if size in group["sizes"] and group["sizes"][size] != json_rel:
@@ -262,13 +334,15 @@ def main():
                     f"incoming={json_rel} pdf={pdf_rel} row={row}",
                     file=sys.stderr,
                 )
-                size_conflicts.append({
-                    "shape_name": shape_name,
-                    "size": size,
-                    "existing": group["sizes"][size],
-                    "incoming": json_rel,
-                    "incoming_pdf": pdf_rel,
-                })
+                size_conflicts.append(
+                    {
+                        "shape_name": shape_name,
+                        "size": size,
+                        "existing": group["sizes"][size],
+                        "incoming": json_rel,
+                        "incoming_pdf": pdf_rel,
+                    }
+                )
             else:
                 group["sizes"][size] = json_rel
 
@@ -284,17 +358,20 @@ def main():
     for shape_name, group in shape_groups.items():
         size_map = dict(group["sizes"])
         size_elements = {
-            size: sorted(ids) for size, ids in group["size_elements"].items()
+            size: list(ids) for size, ids in group["size_elements"].items()
         }
         size_element_counts = {
             size: len(ids) for size, ids in size_elements.items()
         }
         json_elements = {
             json_rel: {
-                "pdfs": sorted(info["pdfs"]),
-                "elements": sorted(info["elements"]),
+                "pdfs": list(info["pdfs"]),
+                "elements": list(info["elements"]),
             }
             for json_rel, info in group["json_elements"].items()
+        }
+        json_element_counts = {
+            json_rel: len(info["elements"]) for json_rel, info in json_elements.items()
         }
         shapes[shape_name] = {
             "pdfs": sorted(group["pdfs"]),
@@ -302,6 +379,7 @@ def main():
             "jsons": sorted(group["jsons"]),
             "size_elements": size_elements,
             "size_element_counts": size_element_counts,
+            "json_element_counts": json_element_counts,
             "json_elements": json_elements,
         }
         shape_max = max(size_element_counts.values(), default=0)
@@ -349,6 +427,7 @@ def main():
         "type_col": int(type_col) if type_col else None,
         "sample_col": int(sample_col) if sample_col else None,
         "skipped_rows": skipped,
+        "duplicate_overwrites": duplicate_overwrites,
         "max_layout_element_count": max_layout_element_count,
         "size_conflicts": size_conflicts,
         "shape_size_index_path": str(out_index),
@@ -362,6 +441,7 @@ def main():
 
     print(f"pdfs: {len(pdf_shape_map)}")
     print(f"shapes: {len(shapes)}")
+    print(f"duplicate_overwrites: {duplicate_overwrites}")
     print(f"size_conflicts: {len(size_conflicts)}")
     print(f"shape_size_index: {out_index}")
     print(f"json_size_lookup: {out_json_lookup}")

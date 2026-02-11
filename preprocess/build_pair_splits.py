@@ -161,6 +161,12 @@ def main():
             print(f"[WARN] skip filtering: elements_embed not found {elements_path}", file=sys.stderr)
     dropped_jsons = 0
     dropped_shapes = 0
+    dropped_shape_reasons = {
+        "missing_elements": 0,
+        "missing_shape_pdfs": 0,
+        "missing_json_pdfs": 0,
+        "shape_element_count_mismatch": 0,
+    }
 
     shape_elements_path = Path(args.shape_elements)
     shape_pdf_map = load_shape_pdf_map(shape_elements_path)
@@ -185,6 +191,7 @@ def main():
                     )
                 dropped_jsons += len(size_map)
                 dropped_shapes += 1
+                dropped_shape_reasons["missing_elements"] += 1
                 continue
             filtered_map = {}
             for size, json_path in size_map.items():
@@ -199,7 +206,54 @@ def main():
             size_map = filtered_map
             if not size_map:
                 dropped_shapes += 1
+                dropped_shape_reasons["missing_elements"] += 1
                 continue
+
+        if shape_pdf_map is not None:
+            pdfs_by_json = shape_pdf_map.get(shape_id)
+            if not pdfs_by_json:
+                for size, json_path in size_map.items():
+                    print(
+                        f"[drop] shape={shape_id} size={size} json={json_path} reason=missing_shape_pdfs",
+                        file=sys.stderr,
+                    )
+                dropped_jsons += len(size_map)
+                dropped_shapes += 1
+                dropped_shape_reasons["missing_shape_pdfs"] += 1
+                continue
+
+            size_counts = {}
+            missing = []
+            for size, json_path in size_map.items():
+                pdfs = pdfs_by_json.get(json_path)
+                if not pdfs:
+                    missing.append((size, json_path))
+                    continue
+                size_counts[size] = len(pdfs)
+
+            if missing:
+                dropped_jsons += len(size_map)
+                dropped_shapes += 1
+                dropped_shape_reasons["missing_json_pdfs"] += 1
+                missing_desc = ", ".join(f"{size}:{json_path}" for size, json_path in missing)
+                print(
+                    f"[drop] shape={shape_id} reason=missing_json_pdfs missing={missing_desc}",
+                    file=sys.stderr,
+                )
+                continue
+
+            if size_counts:
+                unique_counts = sorted(set(size_counts.values()))
+                if len(unique_counts) > 1:
+                    dropped_jsons += len(size_map)
+                    dropped_shapes += 1
+                    dropped_shape_reasons["shape_element_count_mismatch"] += 1
+                    counts_desc = ", ".join(f"{k}:{v}" for k, v in sorted(size_counts.items()))
+                    print(
+                        f"[drop] shape={shape_id} reason=shape_element_count_mismatch counts={counts_desc}",
+                        file=sys.stderr,
+                    )
+                    continue
 
         sizes = sorted(size_map.keys())
         pairs = []
@@ -286,16 +340,16 @@ def main():
         "filter_pdf_pairs": bool(shape_pdf_map is not None),
         "filtered_jsons": dropped_jsons,
         "filtered_shapes": dropped_shapes,
+        "filtered_shape_reasons": dropped_shape_reasons,
         "filtered_pairs": dropped_pairs,
         "shapes": shape_stats,
         "splits": splits,
     }
     out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"shapes: {len(shapes)}")
-    if valid_layouts is not None:
-        print(f"filtered jsons: {dropped_jsons} (shapes dropped: {dropped_shapes})")
-    if shape_pdf_map is not None:
-        print(f"filtered pairs (pdf filter): {dropped_pairs}")
+    print(f"dropped shapes: {dropped_shapes} reasons={dropped_shape_reasons}")
+    print(f"dropped jsons: {dropped_jsons}")
+    print(f"dropped pairs (pdf filter): {dropped_pairs}")
     print(f"train pairs: {len(splits['train'])}")
     print(f"val pairs: {len(splits['val'])}")
     print(f"test pairs: {len(splits['test'])}")
