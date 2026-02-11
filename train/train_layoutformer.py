@@ -29,6 +29,13 @@ from models.LayoutFormer import LayoutFormer
 NORM_RANGE = 10.0
 
 
+def format_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
 def is_dist_ready() -> bool:
     return dist.is_available() and dist.is_initialized()
 
@@ -798,7 +805,9 @@ def main():
             run_name = datetime.now().strftime("%Y%m%d-%H%M%S")
             writer = SummaryWriter(log_dir=str(log_dir / run_name))
 
+    run_start = time.perf_counter()
     for epoch in range(1, args.epochs + 1):
+        epoch_start = time.perf_counter()
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         if val_sampler is not None:
@@ -895,6 +904,10 @@ def main():
         avg_rot = running_rot / denom
         avg_shape = running_shape / denom
         avg_reg = running_reg / denom
+        epoch_seconds = time.perf_counter() - epoch_start
+        elapsed_seconds = time.perf_counter() - run_start
+        avg_epoch_seconds = elapsed_seconds / max(1, epoch)
+        eta_seconds = avg_epoch_seconds * max(0, args.epochs - epoch)
 
         if writer is not None:
             writer.add_scalar("train/loss", avg_loss, epoch)
@@ -994,7 +1007,9 @@ def main():
             if is_main_process():
                 print(
                     f"epoch {epoch} train: loss={avg_loss:.6f} pos={avg_pos:.6f} dim={avg_dim:.6f} rot={avg_rot:.6f} "
-                    f"shape={avg_shape:.6f} reg={avg_reg:.6f}"
+                    f"shape={avg_shape:.6f} reg={avg_reg:.6f} "
+                    f"time={format_duration(epoch_seconds)} elapsed={format_duration(elapsed_seconds)} "
+                    f"eta={format_duration(eta_seconds)}"
                 )
                 print(
                     f"epoch {epoch} val:   loss={val_loss:.6f} pos={val_pos:.6f} dim={val_dim:.6f} rot={val_rot:.6f} "
@@ -1027,7 +1042,9 @@ def main():
             if is_main_process():
                 print(
                     f"epoch {epoch} train: loss={avg_loss:.6f} pos={avg_pos:.6f} dim={avg_dim:.6f} rot={avg_rot:.6f} "
-                    f"shape={avg_shape:.6f} reg={avg_reg:.6f} (eval skipped)"
+                    f"shape={avg_shape:.6f} reg={avg_reg:.6f} (eval skipped) "
+                    f"time={format_duration(epoch_seconds)} elapsed={format_duration(elapsed_seconds)} "
+                    f"eta={format_duration(eta_seconds)}"
                 )
 
         if is_main_process() and epoch == 5:
