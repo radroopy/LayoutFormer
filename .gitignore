@@ -16,6 +16,7 @@ result/model/
 test/result/
 /data
 /reslut
+/adjust
 
 # Office 临时文件
 ~$*.xlsx

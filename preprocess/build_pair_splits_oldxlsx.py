@@ -199,8 +199,13 @@ def main():
         help="Path to shape_element_map.json (used to filter pairs with pdf mismatch).",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--train-ratio", type=float, default=0.95, help="Train ratio")
-    parser.add_argument("--val-ratio", type=float, default=0.05, help="Val ratio")
+    parser.add_argument("--train-ratio", type=float, default=0.95, help="Reserved for compatibility; actual split is shape-disjoint.")
+    parser.add_argument(
+        "--val-ratio",
+        type=float,
+        default=0.05,
+        help="Ratio of non-test shapes assigned to val (shape-disjoint).",
+    )
     parser.add_argument(
         "--exclude-self",
         action="store_true",
@@ -266,6 +271,8 @@ def main():
 
     splits = {"train": [], "val": [], "test": []}
     shape_stats = {}
+    shape_pairs = {}
+    shape_num_sizes = {}
 
     for shape_id, size_map in shapes.items():
         if valid_layouts is not None:
@@ -420,23 +427,43 @@ def main():
                 )
 
         rng.shuffle(pairs)
-        n = len(pairs)
+        shape_pairs[shape_id] = pairs
+        shape_num_sizes[shape_id] = len(sizes)
 
+    non_test_shapes = [sid for sid in shape_pairs.keys() if sid not in test_shapes]
+    rng.shuffle(non_test_shapes)
+    n_val_shapes = int(len(non_test_shapes) * args.val_ratio)
+    if args.val_ratio > 0 and len(non_test_shapes) > 1:
+        n_val_shapes = max(1, n_val_shapes)
+        n_val_shapes = min(n_val_shapes, len(non_test_shapes) - 1)
+    val_shape_set = set(non_test_shapes[:n_val_shapes])
+    train_shape_set = set(non_test_shapes[n_val_shapes:])
+
+    for shape_id, pairs in shape_pairs.items():
+        n = len(pairs)
         if shape_id in test_shapes:
-            splits["test"].extend(pairs)
+            split_name = "test"
             n_train = 0
             n_val = 0
             n_test = n
-        else:
-            n_train = int(n * args.train_ratio)
-            n_val = n - n_train
+            splits["test"].extend(pairs)
+        elif shape_id in val_shape_set:
+            split_name = "val"
+            n_train = 0
+            n_val = n
             n_test = 0
-            splits["train"].extend(pairs[:n_train])
-            splits["val"].extend(pairs[n_train:])
+            splits["val"].extend(pairs)
+        else:
+            split_name = "train"
+            n_train = n
+            n_val = 0
+            n_test = 0
+            splits["train"].extend(pairs)
 
         shape_stats[shape_id] = {
-            "num_sizes": len(sizes),
+            "num_sizes": shape_num_sizes.get(shape_id, 0),
             "num_pairs": n,
+            "split": split_name,
             "train": n_train,
             "val": n_val,
             "test": n_test,
@@ -452,8 +479,11 @@ def main():
         "old_xlsx": str(old_xlsx_path),
         "train_ratio": args.train_ratio,
         "val_ratio": args.val_ratio,
+        "split_strategy": "shape_disjoint_train_val_test",
         "exclude_self": bool(args.exclude_self),
         "test_shapes": len(test_shapes),
+        "val_shapes": len(val_shape_set),
+        "train_shapes": len(train_shape_set),
         "shape_index": str(shape_index_path),
         "size_scale_factors": str(size_scale_path),
         "elements_embed": str(elements_path),
@@ -472,6 +502,8 @@ def main():
     out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"shapes: {len(shapes)}")
     print(f"test shapes: {len(test_shapes)}")
+    print(f"val shapes: {len(val_shape_set)}")
+    print(f"train shapes: {len(train_shape_set)}")
     print(f"dropped shapes: {dropped_shapes} reasons={dropped_shape_reasons}")
     print(f"dropped jsons: {dropped_jsons}")
     print(f"dropped pairs: {dropped_pairs} reasons={dropped_pair_reasons}")
