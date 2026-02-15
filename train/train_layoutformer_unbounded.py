@@ -350,14 +350,25 @@ def _sample_sdf(sdf_maps: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
     return sampled.squeeze(1).squeeze(-1)  # (B, N)
 
 
-def compute_losses(pred, gt, mask, sdf_maps, sdf_hw, log_dim=False, log_pos=False, log_eps=1e-6):
+def compute_losses(
+    pred,
+    gt,
+    mask,
+    sdf_maps,
+    sdf_hw,
+    log_dim=False,
+    log_pos=False,
+    log_eps=1e-6,
+    pos_loss="huber",
+    pos_delta=0.1,
+):
     """
     计算训练/验证用的各项损失（与你给的公式对齐）。
     
     pred / gt: (B,N,6)，6=[x,y,w,h,sin,cos]（都在归一化空间里计算 loss）。
     mask: (B,N)，有效元素为 1，padding 为 0。
     
-    L_pos: 位置损失（x,y 的 MSE）
+    L_pos: 位置损失（x,y，默认 Huber）
     L_dim: 尺寸损失（w,h 的 L1）
     L_rot: 方向损失（sin,cos 的 MSE）
     L_reg: 旋转一致性正则（|sin^2 + cos^2 - 1|）
@@ -377,9 +388,19 @@ def compute_losses(pred, gt, mask, sdf_maps, sdf_hw, log_dim=False, log_pos=Fals
     if log_pos:
         pred_xy_log = torch.log1p(pred_xy.clamp(min=0.0) + log_eps)
         gt_xy_log = torch.log1p(gt_xy.clamp(min=0.0) + log_eps)
-        l_pos = masked_mean((pred_xy_log - gt_xy_log) ** 2, mask)
+        pos_err = pred_xy_log - gt_xy_log
     else:
-        l_pos = masked_mean((pred_xy - gt_xy) ** 2, mask)
+        pos_err = pred_xy - gt_xy
+
+    if pos_loss == "huber":
+        pos_abs = pos_err.abs()
+        delta = float(pos_delta)
+        quad = 0.5 * pos_err.pow(2)
+        lin = delta * (pos_abs - 0.5 * delta)
+        pos_term = torch.where(pos_abs <= delta, quad, lin)
+        l_pos = masked_mean(pos_term, mask)
+    else:
+        l_pos = masked_mean(pos_err.pow(2), mask)
 
     if log_dim:
         pred_wh_log = torch.log1p(pred_wh.clamp(min=0.0) + log_eps)
@@ -664,11 +685,11 @@ def main():
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument(
         "--log-dir",
-        default=str(Path(__file__).resolve().parents[1] / "adjust" / "1" / "logs"),
+        default=str(Path(__file__).resolve().parents[1] / "adjust" / "Huber" / "logs"),
         help="TensorBoard log directory",
     )
-    parser.add_argument("--lambda-pos", type=float, default=10)
-    parser.add_argument("--lambda-dim", type=float, default=10)
+    parser.add_argument("--lambda-pos", type=float, default=30)
+    parser.add_argument("--lambda-dim", type=float, default=5)
     parser.add_argument("--lambda-rot", type=float, default=1.0)
     parser.add_argument("--lambda-shape", type=float, default=1.0)
     parser.add_argument("--lambda-reg", type=float, default=1.0)
@@ -701,6 +722,18 @@ def main():
         dest="log_pos_loss",
         action="store_false",
         help="Disable log1p loss for x/y.",
+    )
+    parser.add_argument(
+        "--pos-loss",
+        choices=["huber", "mse"],
+        default="huber",
+        help="Position loss type for x/y (default: huber).",
+    )
+    parser.add_argument(
+        "--pos-delta",
+        type=float,
+        default=0.1,
+        help="Huber delta for position loss (default: 0.1).",
     )
     parser.add_argument("--log-eps", type=float, default=1e-6)
     parser.add_argument("--save-dir", default=str(Path(__file__).resolve().parents[1] / "adjust" / "1" / "model"))
@@ -917,6 +950,8 @@ def main():
                 log_dim=args.log_dim_loss,
                 log_pos=args.log_pos_loss,
                 log_eps=args.log_eps,
+                pos_loss=args.pos_loss,
+                pos_delta=args.pos_delta,
             )
             loss = (
                 args.lambda_pos * l_pos
@@ -984,6 +1019,11 @@ def main():
             val_shape = 0.0
             val_reg = 0.0
             geom_sum = 0.0
+            val_mae_x_sum = 0.0
+            val_mae_y_sum = 0.0
+            val_mae_w_sum = 0.0
+            val_mae_h_sum = 0.0
+            val_mae_count = 0.0
             val_steps = 0.0
             with torch.no_grad():
                 for batch in val_loader:
@@ -1020,7 +1060,16 @@ def main():
                         src_pos_embed=src_pos,
                     )
                     l_pos, l_dim, l_rot, l_reg, l_shape = compute_losses(
-                        pred, tgt_geom, valid, sdf_maps=sdf_maps, sdf_hw=sdf_hw
+                        pred,
+                        tgt_geom,
+                        valid,
+                        sdf_maps=sdf_maps,
+                        sdf_hw=sdf_hw,
+                        log_dim=args.log_dim_loss,
+                        log_pos=args.log_pos_loss,
+                        log_eps=args.log_eps,
+                        pos_loss=args.pos_loss,
+                        pos_delta=args.pos_delta,
                     )
                     loss = (
                         args.lambda_pos * l_pos
@@ -1036,6 +1085,14 @@ def main():
                     val_shape += l_shape.item()
                     val_reg += l_reg.item()
                     geom_sum += (l_pos + l_dim + l_rot).item()
+                    abs_xywh = (pred[..., :4] - tgt_geom[..., :4]).abs()
+                    valid_exp = valid.unsqueeze(-1)
+                    abs_sum = (abs_xywh * valid_exp).sum(dim=(0, 1))
+                    val_mae_x_sum += float(abs_sum[0].item())
+                    val_mae_y_sum += float(abs_sum[1].item())
+                    val_mae_w_sum += float(abs_sum[2].item())
+                    val_mae_h_sum += float(abs_sum[3].item())
+                    val_mae_count += float(valid.sum().item())
                     val_steps += 1.0
 
             (
@@ -1046,12 +1103,32 @@ def main():
                 val_shape,
                 val_reg,
                 geom_sum,
+                val_mae_x_sum,
+                val_mae_y_sum,
+                val_mae_w_sum,
+                val_mae_h_sum,
+                val_mae_count,
                 val_steps,
             ) = reduce_metrics(
-                [val_loss, val_pos, val_dim, val_rot, val_shape, val_reg, geom_sum, val_steps],
+                [
+                    val_loss,
+                    val_pos,
+                    val_dim,
+                    val_rot,
+                    val_shape,
+                    val_reg,
+                    geom_sum,
+                    val_mae_x_sum,
+                    val_mae_y_sum,
+                    val_mae_w_sum,
+                    val_mae_h_sum,
+                    val_mae_count,
+                    val_steps,
+                ],
                 device,
             )
             val_denom = max(1.0, val_steps)
+            val_mae_denom = max(1.0, val_mae_count)
             val_loss = val_loss / val_denom
             val_pos = val_pos / val_denom
             val_dim = val_dim / val_denom
@@ -1059,6 +1136,10 @@ def main():
             val_shape = val_shape / val_denom
             val_reg = val_reg / val_denom
             geom_sum = geom_sum / val_denom
+            val_mae_x = val_mae_x_sum / val_mae_denom
+            val_mae_y = val_mae_y_sum / val_mae_denom
+            val_mae_w = val_mae_w_sum / val_mae_denom
+            val_mae_h = val_mae_h_sum / val_mae_denom
             if is_main_process():
                 print(
                     f"epoch {epoch} train: loss={avg_loss:.6f} pos={avg_pos:.6f} dim={avg_dim:.6f} rot={avg_rot:.6f} "
@@ -1068,7 +1149,8 @@ def main():
                 )
                 print(
                     f"epoch {epoch} val:   loss={val_loss:.6f} pos={val_pos:.6f} dim={val_dim:.6f} rot={val_rot:.6f} "
-                    f"shape={val_shape:.6f} reg={val_reg:.6f} geom_sum={geom_sum:.6f}"
+                    f"shape={val_shape:.6f} reg={val_reg:.6f} geom_sum={geom_sum:.6f} "
+                    f"MAE(x,y,w,h)=({val_mae_x:.6f},{val_mae_y:.6f},{val_mae_w:.6f},{val_mae_h:.6f})"
                 )
 
             if writer is not None:
@@ -1079,6 +1161,10 @@ def main():
                 writer.add_scalar("val/shape", val_shape, epoch)
                 writer.add_scalar("val/reg", val_reg, epoch)
                 writer.add_scalar("val/geom_sum", geom_sum, epoch)
+                writer.add_scalar("val/mae_x", val_mae_x, epoch)
+                writer.add_scalar("val/mae_y", val_mae_y, epoch)
+                writer.add_scalar("val/mae_w", val_mae_w, epoch)
+                writer.add_scalar("val/mae_h", val_mae_h, epoch)
 
             if is_main_process():
                 ckpt = {
