@@ -80,10 +80,12 @@ def safe_torch_save(obj: dict, path: Path):
         torch.save(obj, tmp)
         try:
             os.replace(tmp, path)
+            print(f"[SAVE] {path}")
         except Exception as exc:
             fallback = path.with_name(f"{path.stem}_{int(time.time())}{path.suffix}")
             os.replace(tmp, fallback)
             print(f"[WARN] could not replace {path} ({exc}); saved to {fallback}")
+            print(f"[SAVE] {fallback}")
     except Exception as exc:
         print(f"[WARN] failed to save {path}: {exc}")
         if tmp.exists():
@@ -359,7 +361,7 @@ def compute_losses(
     log_dim=False,
     log_pos=False,
     log_eps=1e-6,
-    pos_loss="huber",
+    pos_loss="d",
     pos_delta=0.1,
 ):
     """
@@ -879,7 +881,7 @@ def main():
 
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
-    best_val = math.inf
+    best_train = math.inf
 
     writer = None
     if is_main_process():
@@ -1171,13 +1173,14 @@ def main():
                     "epoch": epoch,
                     "model_state": model_for_ckpt.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
+                    "train_loss": avg_loss,
                     "val_loss": val_loss,
                     "geom_sum": geom_sum,
                     "args": vars(args),
                 }
                 safe_torch_save(ckpt, save_dir / "last.pt")
-                if val_loss < best_val:
-                    best_val = val_loss
+                if avg_loss < best_train:
+                    best_train = avg_loss
                     safe_torch_save(ckpt, save_dir / "best.pt")
         else:
             if is_main_process():
